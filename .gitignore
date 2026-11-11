@@ -1,0 +1,10 @@
+/.venv/
+/ProjectWatchAI/.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+/ProjectWatchAI/data/
+/ProjectWatchAI/photos/
+/ProjectWatchAI/photos.json
+/ProjectWatchAI/run-output.txt
