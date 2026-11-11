@@ -13,21 +13,21 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 FILE = DATA_DIR / "dpwh_projects.parquet"
 
 
-def download_dataset():
-    if FILE.exists():
-        print("Dataset already downloaded.")
+def download_dataset(url=URL, destination=FILE):
+    if destination.exists():
+        print(f"Dataset already downloaded: {destination.name}")
         return
 
-    DATA_DIR.mkdir(exist_ok=True)
-    partial_file = FILE.with_suffix(".parquet.part")
-    print("Downloading DPWH dataset...")
-    with requests.get(URL, stream=True, timeout=120) as response:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial_file = destination.with_suffix(".parquet.part")
+    print(f"Downloading {destination.name}...")
+    with requests.get(url, stream=True, timeout=120) as response:
         response.raise_for_status()
         with partial_file.open("wb") as output:
             for chunk in response.iter_content(1024 * 1024):
                 if chunk:
                     output.write(chunk)
-    partial_file.replace(FILE)
+    partial_file.replace(destination)
     print("Download complete!")
 
 

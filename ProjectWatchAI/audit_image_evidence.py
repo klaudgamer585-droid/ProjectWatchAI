@@ -75,11 +75,11 @@ def audit_images(
     return audit
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Audit Region III project image evidence.")
     parser.add_argument("--photos", type=Path, help="JSON manifest of local photos and capture dates.")
     parser.add_argument("--contract-id", help="Print the audit row for one contract.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     projects = pd.read_parquet(PROJECTS_FILE, columns=["contractId", "status", "completionDate"])
     details = pd.read_parquet(
