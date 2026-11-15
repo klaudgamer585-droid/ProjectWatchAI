@@ -1,0 +1,24 @@
+services:
+  projectwatch:
+    build:
+      context: .
+      args:
+        ENABLE_YOLO: "true"
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+      PROJECTWATCH_PHOTO_REVIEW_DB: /app/data/reviewed_photos.sqlite3
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  ollama:
+    image: ${OLLAMA_IMAGE:?Set OLLAMA_IMAGE to your tested Ollama image tag or digest}
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+volumes:
+  ollama-models:

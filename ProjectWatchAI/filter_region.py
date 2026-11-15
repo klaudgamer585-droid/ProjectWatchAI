@@ -14,13 +14,19 @@ def filter_region_iii(projects: pd.DataFrame) -> pd.DataFrame:
         lambda location: location.get("region") if isinstance(location, dict) else None
     )
     regional_projects = projects.loc[regions.eq(REGION)].copy()
-    regional_projects["infrastructureCategories"] = (
+    regional_projects["infrastructureCategories"] = infrastructure_categories(
         regional_projects["componentCategories"]
+    )
+    return regional_projects
+
+
+def infrastructure_categories(component_categories: pd.Series) -> pd.Series:
+    return (
+        component_categories
         .fillna("")
         .map(lambda value: value.strip() or "Uncategorized")
         .str.split(r"\s*,\s*", regex=True)
     )
-    return regional_projects
 
 
 def main():

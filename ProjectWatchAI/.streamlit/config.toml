@@ -1,0 +1,27 @@
+[theme]
+base = "dark"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+showWidgetBorder = true
+baseRadius = "8px"
+
+[theme.dark]
+primaryColor = "#2DD4BF"
+backgroundColor = "#0A0F1A"
+secondaryBackgroundColor = "#111B2B"
+textColor = "#E6EDF7"
+borderColor = "#1F2C40"
+dataframeHeaderBackgroundColor = "#162238"
+
+[theme.dark.sidebar]
+backgroundColor = "#0D1420"
+
+[theme.light]
+primaryColor = "#08766C"
+backgroundColor = "#F0F5F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#17253A"
+borderColor = "#C8D5E3"
+dataframeHeaderBackgroundColor = "#E8F0F7"
+
+[theme.light.sidebar]
+backgroundColor = "#F8FBFD"

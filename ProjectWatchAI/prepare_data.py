@@ -10,6 +10,7 @@ def main():
     download_dataset(DETAILS_URL, DETAILS_FILE)
     filter_projects()
     audit([])
+    audit(["--nationwide"])
 
 
 if __name__ == "__main__":

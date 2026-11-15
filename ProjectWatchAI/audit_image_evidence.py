@@ -4,20 +4,21 @@ from pathlib import Path
 
 import pandas as pd
 
-from run import DATA_DIR
+from run import DATA_DIR, FILE as NATIONWIDE_PROJECTS_FILE
 
 
 PROJECTS_FILE = DATA_DIR / "region_iii_projects.parquet"
 DETAILS_FILE = DATA_DIR / "dpwh_details.parquet"
 REPORT_FILE = DATA_DIR / "region_iii_image_audit.parquet"
+NATIONWIDE_REPORT_FILE = DATA_DIR / "dpwh_image_audit.parquet"
 PHOTO_COLUMNS = ["contractId", "suppliedPhotoCount", "latestPhotoDate", "latestPhotoPath"]
 
 
-def read_photos(manifest: Path) -> pd.DataFrame:
+def read_photo_manifest(manifest: Path) -> pd.DataFrame:
     """Read local photo paths and capture dates from a JSON array."""
     photos = pd.read_json(manifest, dtype=False, convert_dates=False)
     if photos.empty:
-        return pd.DataFrame(columns=PHOTO_COLUMNS)
+        return pd.DataFrame(columns=["contractId", "imagePath", "captureDate"])
 
     required = {"contractId", "imagePath", "captureDate"}
     if not required.issubset(photos.columns):
@@ -36,6 +37,14 @@ def read_photos(manifest: Path) -> pd.DataFrame:
     if photos["imagePath"].duplicated().any():
         raise ValueError("Each photo file must appear only once in the manifest.")
 
+    return photos
+
+
+def read_photos(manifest: Path) -> pd.DataFrame:
+    photos = read_photo_manifest(manifest)
+    if photos.empty:
+        return pd.DataFrame(columns=PHOTO_COLUMNS)
+
     return photos.sort_values("captureDate", kind="stable").groupby("contractId", as_index=False).agg(
         suppliedPhotoCount=("imagePath", "size"),
         latestPhotoDate=("captureDate", "last"),
@@ -48,7 +57,7 @@ def audit_images(
 ) -> pd.DataFrame:
     unknown_ids = photos.loc[~photos["contractId"].isin(projects["contractId"]), "contractId"]
     if not unknown_ids.empty:
-        raise ValueError(f"Photo contract IDs absent from Region III: {unknown_ids.tolist()}")
+        raise ValueError(f"Photo contract IDs absent from the selected dataset: {unknown_ids.tolist()}")
 
     audit = projects.merge(details, on="contractId", how="left", validate="one_to_one")
     audit = audit.merge(photos, on="contractId", how="left", validate="one_to_one")
@@ -76,12 +85,15 @@ def audit_images(
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Audit Region III project image evidence.")
+    parser = argparse.ArgumentParser(description="Audit DPWH project image evidence.")
+    parser.add_argument("--nationwide", action="store_true", help="Audit the full DPWH snapshot.")
     parser.add_argument("--photos", type=Path, help="JSON manifest of local photos and capture dates.")
     parser.add_argument("--contract-id", help="Print the audit row for one contract.")
     args = parser.parse_args(argv)
 
-    projects = pd.read_parquet(PROJECTS_FILE, columns=["contractId", "status", "completionDate"])
+    projects_file = NATIONWIDE_PROJECTS_FILE if args.nationwide else PROJECTS_FILE
+    report_file = NATIONWIDE_REPORT_FILE if args.nationwide else REPORT_FILE
+    projects = pd.read_parquet(projects_file, columns=["contractId", "status", "completionDate"])
     details = pd.read_parquet(
         DETAILS_FILE, columns=["contractId", "hasImages", "totalImages", "latestImageDate"]
     )
@@ -94,10 +106,10 @@ def main(argv=None):
     if args.contract_id:
         selected = audit.loc[audit["contractId"].eq(args.contract_id)]
         if selected.empty:
-            parser.error(f"Contract {args.contract_id} was not found in Region III.")
+            parser.error(f"Contract {args.contract_id} was not found in the selected dataset.")
         print(selected.iloc[0].to_json(indent=2, date_format="iso"))
 
-    audit.to_parquet(REPORT_FILE, index=False)
+    audit.to_parquet(report_file, index=False)
     print(f"Audited {len(audit):,} contracts")
     for flag in (
         "missingImages",
@@ -107,7 +119,7 @@ def main(argv=None):
         "imageDateMismatch",
     ):
         print(f"{flag}: {audit[flag].sum():,}")
-    print(f"Saved to {REPORT_FILE}")
+    print(f"Saved to {report_file}")
 
 
 if __name__ == "__main__":
