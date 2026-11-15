@@ -85,7 +85,7 @@ python -B -m unittest test_audit_regressions -v
 
 The suite uses disposable databases and mocked network calls. It covers latest-date policy, same-date conflicts, experimental-model restrictions, raw thresholds, timezone normalization, budget boundaries, output validation, persistent Ollama batches, content-based cache reuse, review history, and requeueing existing contracts. Live API, Ollama, UI, and deployment checks are additional integration checks, not covered by mocked tests.
 
-## Huawei ECS / Docker inference deployment
+## Run with Docker Compose
 
 The Docker image includes YOLO by default and runs inference on CPU with two PyTorch threads. Training remains a local workflow; deploy selected checkpoints and approval files, not all candidate datasets or training runs. Preserve their directory layout under `data/` so the registry can find them. Persist reviews, corrections, manual evidence, and Ollama batch caches on writable storage.
 
@@ -99,5 +99,3 @@ curl --fail http://127.0.0.1:8501/_stcore/health
 ```
 
 The dashboard uses `http://ollama:11434` inside the network; container localhost would be incorrect. Set `OLLAMA_MODEL` if using another installed model. The example binds Streamlit to loopback; place it behind your authenticated HTTPS reverse proxy before public access. It is a single-reviewer application, not a multi-tenant service.
-
-Use Huawei ECS compute and persistent disk for the services. OBS may store curated evidence separately, but is not required by this implementation. Cloud deployment and resource sizing still need an end-to-end test on the chosen ECS instance.
