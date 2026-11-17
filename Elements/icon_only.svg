@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="BantAI Proyekto ant with magnifying glass icon">
+<title>BantAI Proyekto — ant and magnifying glass</title>
+<!-- Bold antennae, cropped peeking ant silhouette -->
+<path d="M102 184 C62 145 63 97 94 60" fill="none" stroke="#D93829" stroke-width="36" stroke-linecap="round"/>
+<circle cx="94" cy="60" r="19" fill="#D93829"/>
+<path d="M211 177 C202 114 224 72 257 45" fill="none" stroke="#D93829" stroke-width="36" stroke-linecap="round"/>
+<circle cx="257" cy="45" r="19" fill="#D93829"/>
+<!-- Ant head -->
+<path d="M21 327 C21 229 88 165 188 163 C277 161 342 220 352 303 C361 392 287 455 186 455 L86 455 C44 452 21 412 21 370Z" fill="#D93829"/>
+<!-- Eyes: thick cream negative-space discs with red circular pupils -->
+<circle cx="115" cy="304" r="69" fill="#F8F7F4"/>
+<circle cx="252" cy="304" r="65" fill="#F8F7F4"/>
+<circle cx="139" cy="299" r="33" fill="#D93829"/>
+<circle cx="269" cy="299" r="29" fill="#D93829"/>
+<circle cx="147" cy="287" r="12" fill="#F8F7F4"/>
+<circle cx="278" cy="288" r="10" fill="#F8F7F4"/>
+<!-- Lens handle is thick and rounded; ring zooms an enlarged iris -->
+<path d="M292 368 L249 446" fill="none" stroke="#1E1E1E" stroke-width="49" stroke-linecap="round"/>
+<circle cx="355" cy="258" r="133" fill="#1E1E1E"/>
+<circle cx="355" cy="258" r="104" fill="#DDEFF6"/>
+<circle cx="351" cy="275" r="76" fill="#D93829"/>
+<circle cx="356" cy="285" r="49" fill="#F8F7F4"/>
+<circle cx="380" cy="250" r="26" fill="#D93829"/>
+<!-- Optical reflection, deliberately a flat solid silhouette -->
+<path d="M390 176 C410 181 431 203 432 220" fill="none" stroke="#F8F7F4" stroke-width="18" stroke-linecap="round"/>
+<!-- Discovery rays -->
+<path d="M429 72 L444 39 M465 105 L490 80 M477 142 L508 131" fill="none" stroke="#D93829" stroke-width="17" stroke-linecap="round"/>
+</svg>

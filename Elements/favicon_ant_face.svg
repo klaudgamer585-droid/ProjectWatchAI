@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="BantAI Proyekto ant face favicon">
+<title>BantAI Proyekto — ant face only</title>
+<path d="M77 114 C55 88 57 49 77 31" fill="none" stroke="#D93829" stroke-width="22" stroke-linecap="round"/>
+<circle cx="77" cy="31" r="13" fill="#D93829"/>
+<path d="M153 108 C151 72 162 44 184 27" fill="none" stroke="#D93829" stroke-width="22" stroke-linecap="round"/>
+<circle cx="184" cy="27" r="13" fill="#D93829"/>
+<path d="M17 168 C17 121 64 98 127 98 C191 98 239 121 239 168 L239 205 C239 230 217 240 192 240 L64 240 C39 240 17 230 17 205Z" fill="#D93829"/>
+<circle cx="82" cy="177" r="46" fill="#F8F7F4"/>
+<circle cx="174" cy="177" r="46" fill="#F8F7F4"/>
+<circle cx="99" cy="170" r="22" fill="#D93829"/>
+<circle cx="188" cy="170" r="22" fill="#D93829"/>
+<circle cx="106" cy="162" r="7" fill="#F8F7F4"/>
+<circle cx="195" cy="162" r="7" fill="#F8F7F4"/>
+</svg>

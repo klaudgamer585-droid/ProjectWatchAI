@@ -169,7 +169,7 @@ class PersistenceTests(unittest.TestCase):
         r = record([photo("2025-01-02", "paved road surface")])
         r["assessment"] = assess_contract(r)
         self.app.save_contract_assessments([r], require_saved=True)
-        self.app.save_manual_category(r, "Completed · manual review", "Reviewed visible scope")
+        self.app.save_manual_category(r, "Completed · manual review", "Reviewed visible scope", "Test Reviewer")
         a = self.app.assess_with_manual_review(r)
         self.assertIn("manual_review_provenance", a)
         changed = deepcopy(r)

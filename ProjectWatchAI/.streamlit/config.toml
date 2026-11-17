@@ -1,27 +1,112 @@
+# BantAIProyekto theme. Design direction and measured contrast: docs/ui-ux-implementation.md §4.
+# Colour meaning (never decorative):
+#   blue   = automatic photo observation (lens)    violet slot = reviewer decision (sand)
+#   orange = needs review / construction cue       red         = analysis failed / error
+#   gray   = evidence gap / source / neutral       green       = saved confirmation only
+# Brand red appears only in the supplied marks: #C9291B tile (Logo.png) and #D93829 "AI" (Elements/*.svg).
+# It is never an error, status or navigation colour; errors use redColor/redTextColor below with icon + words.
+# Custom colours that the theme cannot hold (focus ring, active nav row) are in ui.py via light-dark().
+
+[server]
+# Serves static/ (vendored fonts, derived brand marks) at app/static/.
+enableStaticServing = true
+# The tester rejects photos over 12 MB; keep the uploader's stated limit consistent.
+maxUploadSize = 12
+
+[client]
+# Viewers keep the settings menu (theme switch); developer-only options such as Deploy are hidden.
+toolbarMode = "viewer"
+
 [theme]
-base = "dark"
-font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+font = "Atkinson Hyperlegible Next, system-ui, Segoe UI, sans-serif"
+headingFont = "Atkinson Hyperlegible Next, system-ui, Segoe UI, sans-serif"
+baseFontSize = 16
+headingFontSizes = ["1.875rem", "1.375rem", "1.125rem", "1rem", "0.875rem", "0.875rem"]
+headingFontWeights = [800, 800, 600, 600, 600, 600]
+# Metric values stay below the page title (30 px) in the hierarchy; plan §7 section scale is 20–24 px.
+metricValueFontSize = "1.5rem"
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
 showWidgetBorder = true
-baseRadius = "8px"
+linkUnderline = true
 
-[theme.dark]
-primaryColor = "#2DD4BF"
-backgroundColor = "#0A0F1A"
-secondaryBackgroundColor = "#111B2B"
-textColor = "#E6EDF7"
-borderColor = "#1F2C40"
-dataframeHeaderBackgroundColor = "#162238"
+[[theme.fontFaces]]
+family = "Atkinson Hyperlegible Next"
+url = "app/static/fonts/AtkinsonHyperlegibleNext-Variable.ttf"
+weight = "200 800"
+style = "normal"
 
-[theme.dark.sidebar]
-backgroundColor = "#0D1420"
+[[theme.fontFaces]]
+family = "Atkinson Hyperlegible Next"
+url = "app/static/fonts/AtkinsonHyperlegibleNext-Italic-Variable.ttf"
+weight = "200 800"
+style = "italic"
 
 [theme.light]
-primaryColor = "#08766C"
-backgroundColor = "#F0F5F9"
+primaryColor = "#1C1C1C"
+backgroundColor = "#F6F3EE"
 secondaryBackgroundColor = "#FFFFFF"
-textColor = "#17253A"
-borderColor = "#C8D5E3"
-dataframeHeaderBackgroundColor = "#E8F0F7"
+textColor = "#1C1C1C"
+linkColor = "#1C1C1C"
+borderColor = "#8C857B"
+dataframeBorderColor = "#D9D2C7"
+dataframeHeaderBackgroundColor = "#EFEAE2"
+blueColor = "#2B7FA8"
+blueBackgroundColor = "#E3F1F8"
+blueTextColor = "#174E6B"
+violetColor = "#8C6A3A"
+violetBackgroundColor = "#F0E8DB"
+violetTextColor = "#5A4220"
+orangeColor = "#B7791F"
+orangeBackgroundColor = "#FCEFD3"
+orangeTextColor = "#7A4B00"
+redColor = "#B4382C"
+redBackgroundColor = "#FBE4E1"
+redTextColor = "#A1271B"
+grayColor = "#8A847B"
+grayBackgroundColor = "#ECEAE6"
+grayTextColor = "#4D4A45"
+greenColor = "#3A8A55"
+greenBackgroundColor = "#E2F2E6"
+greenTextColor = "#1F6334"
+# Evidence kinds in order: observation, needs review, failed, gap, reviewer decision.
+chartCategoricalColors = ["#2B7FA8", "#B7791F", "#B4382C", "#8A847B", "#8C6A3A"]
 
 [theme.light.sidebar]
-backgroundColor = "#F8FBFD"
+backgroundColor = "#EFEAE2"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+# Streamlit draws primary-button labels in white; cream (#F1ECE4) measured 1.18:1, so dark uses warm stone:
+# white label 5.24:1, fill vs page 3.6:1, vs surface 3.31:1.
+primaryColor = "#736B61"
+backgroundColor = "#121110"
+secondaryBackgroundColor = "#1C1A18"
+textColor = "#F1ECE4"
+linkColor = "#F1ECE4"
+borderColor = "#7D766C"
+dataframeBorderColor = "#3A3631"
+dataframeHeaderBackgroundColor = "#262320"
+blueColor = "#6CC0E6"
+blueBackgroundColor = "#16303D"
+blueTextColor = "#A8DCF2"
+violetColor = "#C9A876"
+violetBackgroundColor = "#322A1F"
+violetTextColor = "#E7D3B3"
+orangeColor = "#E0A647"
+orangeBackgroundColor = "#3A2C12"
+orangeTextColor = "#F5C46B"
+redColor = "#F0796C"
+redBackgroundColor = "#3D1C19"
+redTextColor = "#FF9E92"
+grayColor = "#9D968C"
+grayBackgroundColor = "#2A2724"
+grayTextColor = "#CFC8BE"
+greenColor = "#6CC48A"
+greenBackgroundColor = "#17301F"
+greenTextColor = "#8FD6A4"
+chartCategoricalColors = ["#6CC0E6", "#E0A647", "#F0796C", "#9D968C", "#C9A876"]
+
+[theme.dark.sidebar]
+backgroundColor = "#1C1A18"
+secondaryBackgroundColor = "#262320"

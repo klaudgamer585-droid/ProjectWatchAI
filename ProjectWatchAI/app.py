@@ -2,26 +2,32 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import html
 import os
 import json
+import re
 import sqlite3
 import logging
 from math import sqrt
-from evidence_policy import (ASSESSMENT_VERSION, INFERENCE_VERSION, EVIDENCE_LIMITATION,
+from evidence_policy import (ASSESSMENT_VERSION, INFERENCE_VERSION,
     checkpoint_digest, evidence_fingerprint, fingerprint, model_quality)
 from hashlib import sha256
 from importlib import reload
 from inspect import signature
 from contextlib import closing
+from functools import partial
 from pathlib import Path
 from threading import Event, Lock, Thread
 from urllib.parse import quote, urlencode, urlsplit
 
-import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
-from ui import apply_theme, navigation, page_header
+import evidence_language as language
+import ui
+from ui import (apply_theme, category_badge, escape_markdown, evidence_overview, navigation, page_header,
+                assessment_summary, photo_with_fallback, show_flags, show_state)
+from ui import empty_state, error_state, field_feedback, freshness, go_to, loading, notice
 
 from audit_image_evidence import PHOTO_COLUMNS, audit_images
 import contract_assessment
@@ -65,6 +71,13 @@ from road_surface import (
 )
 from yolo_feedback import (UNDER_CONSTRUCTION_TRAINING, UNFINISHED_TARGETS, active_weights,
                            feedback_folder, latest_candidate, read_correction, save_correction)
+import model_readiness
+import queue_view
+import queue_worker
+import regional_view
+import review_store
+import review_workspace
+from training_correction import render_training_correction
 
 
 API_URL = "https://api.dpwh.bettergov.ph"
@@ -198,11 +211,11 @@ API_STATUSES = ["Completed", "On-Going", "Not Yet Started", "For Procurement", "
 
 
 FLAGS = {
-    "missingImages": "No images reported",
-    "imageDateMismatch": "Photo date differs from completion",
-    "imageAvailabilityUnknown": "Image availability unknown",
-    "missingImageDate": "Image date unavailable",
-    "missingCompletionDate": "Completion date unavailable",
+    "missingImages": "No photos are available in this source record",
+    "imageDateMismatch": "Latest photo date differs from the reported completion date",
+    "imageAvailabilityUnknown": "Photo availability unknown",
+    "missingImageDate": "Photo capture date unavailable",
+    "missingCompletionDate": "Reported completion date unavailable",
 }
 
 
@@ -255,7 +268,8 @@ def show_satellite_preview(latitude, longitude, copernicus_url):
             raise ValueError("Unexpected imagery response")
         st.image(response.content, width="stretch")
     except (requests.RequestException, ValueError):
-        st.warning("The satellite preview is unavailable. You can open Copernicus Browser below.")
+        error_state("The satellite preview is unavailable.", "The imagery service did not return a picture.",
+                    kept="You can still open Copernicus Browser below.")
     captured = None
     try:
         # Estimate the basemap level from the preview's horizontal pixel span.
@@ -287,42 +301,90 @@ def project_url(contract_id):
 
 
 def main():
-    st.set_page_config(page_title="BantAIProyekto | Infrastructure review", page_icon=":material/account_balance:",
-                       layout="wide", initial_sidebar_state="expanded")
+    # Supplied ant-face favicon; the sidebar collapses automatically on small screens.
+    st.set_page_config(page_title="BantAIProyekto | Infrastructure review", page_icon=ui.FAVICON,
+                       layout="wide", initial_sidebar_state="auto")
     apply_theme()
     # Preserve useful controls when their workspace is not rendered on a rerun.
-    for key in ("admin_section", "live_search", "live_region", "live_category", "live_status", "live_year",
-                "live_photos_only", "live_limit", "live_page", "live_contract", "saved_review_category",
+    for key in ("admin_section", *LIVE_STATE_KEYS, "saved_review_category",
                 "saved_review_search", "regional_region", "regional_year", "regional_category",
                 "regional_status", "regional_search"):
         if key in st.session_state:
             st.session_state[key] = st.session_state[key]
-    page = navigation()
-    # Render the chosen workspace only; inactive admin views no longer fetch or run.
-    if page == "Explore projects":
+    def explore():
         page_header("Explore public projects", "Find DPWH contracts and inspect the records behind each project.")
         show_live_projects()
-    elif page == "Regional review":
-        page_header("Regional review", "Browse saved regional findings, contractor scores, and contract evidence.", "FINDINGS")
+
+    def regional():
+        page_header("Regional review", "Browse saved regional findings, contractor scores, and contract evidence.")
         show_regional_review_page()
-    else:
-        show_admin()
+
+    # Native navigation (st.navigation): one URL per destination, aria-current on the active link. Only the
+    # chosen workspace renders; inactive admin views do not fetch or run.
+    navigation({"Explore projects": explore, "Regional review": regional, "Admin": show_admin}).run()
     with st.expander("About the evidence"):
-        st.caption(EVIDENCE_LIMITATION)
-        st.caption("Photo findings support manual review. Photo dates are capture dates, not independently verified completion dates.")
+        st.caption(language.LIMITATION_TEXT)
+        st.caption("Reported status comes from the DPWH record. Photo assessments are automatic detector "
+                   "observations. Manual decisions are recorded by a reviewer. They are shown separately.")
+        st.caption(language.TIMING_NOTE + " Photo dates are capture dates, not verified completion dates.")
+        st.caption(language.MODEL_SCORE_NOTE)
+
+
+MAX_REVIEW_CONTRACTS = 3
+CONTRACT_ID_SEPARATORS = re.compile(r"[,;\n\r]+")        # comma, semicolon or new line; a space never separates two IDs
+CONTRACT_ID_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9_-]{0,39}")
+
+
+def parse_contract_input(text):
+    """Normalize typed contract IDs. Returns (ids, problem, notes); never drops or splits an entry silently.
+
+    Accepted and normalized: capitals, spaces around an ID, comma / semicolon / new-line separators, repeated
+    separators, and the same ID entered more than once (kept once, and said so in ``notes``).
+    Rejected with a message naming the entry: a space inside an entry ("24CK 0181" could be one ID or two),
+    characters other than letters, numbers, hyphen and underscore, IDs longer than 40 characters, and more
+    than three distinct IDs (nothing is truncated).
+    """
+    entries = [entry.strip() for entry in CONTRACT_ID_SEPARATORS.split(text or "")]
+    entries = [entry for entry in entries if entry]
+    spaced = [entry for entry in entries if re.search(r"\s", entry)]
+    if spaced:
+        return (), ("Separate contract IDs with commas or new lines. An ID has no spaces, so this entry is unclear: "
+                    + "; ".join(f"“{entry}”" for entry in spaced[:3]) + (" …" if len(spaced) > 3 else "") + "."), ()
+    tokens = [entry.upper() for entry in entries]
+    invalid = [entry for entry, token in zip(entries, tokens)
+               if not (entry.isascii() and CONTRACT_ID_PATTERN.fullmatch(token))]      # ASCII first: upper() must not rewrite "ß"
+    if invalid:
+        shown = [entry if len(entry) <= 40 else entry[:40] + "…" for entry in invalid[:5]]
+        return (), ("Contract IDs use letters, numbers and hyphens only, up to 40 characters. Check: "
+                    + ", ".join(shown) + (" …" if len(invalid) > 5 else "") + "."), ()
+    repeats = {token: count for token, count in Counter(tokens).items() if count > 1}
+    notes = tuple(f"{token} was entered {count} times and is reviewed once." for token, count in repeats.items())
+    contracts = tuple(dict.fromkeys(tokens))
+    if len(contracts) > MAX_REVIEW_CONTRACTS:
+        extra = contracts[MAX_REVIEW_CONTRACTS:]
+        return (), (f"Enter up to {MAX_REVIEW_CONTRACTS} contract IDs. Remove {len(extra)} to continue: "
+                    + ", ".join(extra) + "."), notes
+    return contracts, None, notes
+
+
+def parse_contract_ids(text):
+    """(ids, problem) form of parse_contract_input, kept for callers that do not show notes."""
+    ids, problem, _ = parse_contract_input(text)
+    return ids, problem
 
 
 def show_admin():
     page_header("Admin workspace", "Manage reviewed contracts, refresh saved evidence and check detector readiness.", "REVIEW MANAGEMENT")
     with closing(open_assessment_db()) as database:
         groups = dict(database.execute("SELECT category,COUNT(*) FROM contract_assessments GROUP BY category"))
-        pending = database.execute("SELECT COUNT(*) FROM regional_queue WHERE done=0").fetchone()[0]
+        pending = database.execute("""SELECT COUNT(*) FROM regional_queue q WHERE q.done=0 AND NOT EXISTS (
+            SELECT 1 FROM queue_failures f WHERE f.filters=q.filters AND f.contract_id=q.contract_id)""").fetchone()[0]
     metrics = st.columns(3)
     metrics[0].metric("Saved contract reviews", f"{sum(groups.values()):,}")
     attention = sum(count for category, count in groups.items()
                     if category in {NEUTRAL_REVIEW_CATEGORY, "Photos inconclusive", "Photo analysis unavailable · retry needed"})
-    metrics[1].metric("Need evidence review", f"{attention:,}", help="Neutral, inconclusive and unavailable-analysis categories.")
-    metrics[2].metric("Queued checks", f"{pending:,}", help="Pending queue entries; a contract may appear in more than one queue.")
+    metrics[1].metric("Need evidence review", f"{attention:,}", help="Further review needed, inconclusive and failed-analysis categories.")
+    metrics[2].metric("Queued checks", f"{pending:,}", help="Contracts waiting to be reviewed, not counting failed ones (see each queue). A contract may appear in more than one queue.")
     st.write("")
     section = st.radio("Admin section", ["Reviewed contracts", "Regional reviews", "Contract reviews", "Rerun reviews", "Model status"],
                        horizontal=True, key="admin_section", label_visibility="collapsed")
@@ -335,12 +397,17 @@ def show_admin():
         show_regional_review_page(manage=True)
     elif section == "Contract reviews":
         st.subheader("Review individual contracts")
-        query = st.text_input("Contract IDs", placeholder="Enter up to three IDs separated by commas")
-        contracts = tuple(dict.fromkeys(value.strip().upper() for value in query.split(",") if value.strip()))
-        if len(contracts) > 3:
-            st.info("Enter up to three contract IDs.")
+        query = st.text_area("Contract IDs", placeholder="e.g. 24CK0181, 23JE0090", key="admin_contract_ids", height=80,
+                             help="Up to three IDs, separated by commas or new lines. Case and spaces around an ID do not matter.")
+        contracts, problem, notes = parse_contract_input(query)
+        for note in notes:
+            field_feedback(note, kind="info")
+        if problem:
+            field_feedback(problem)
         elif contracts:
             show_ai_reviews(contracts, contracts[0])
+        else:
+            st.caption("Enter up to three contract IDs to review them side by side.")
     elif section == "Rerun reviews":
         st.subheader("Refresh saved reviews")
         st.caption("Choose a category to recheck with the current models. Manual decisions are preserved.")
@@ -349,20 +416,52 @@ def show_admin():
         show_model_status()
 
 
+def model_readiness_rows():
+    rows = []
+    for detector, (baseline, _, target, _) in YOLO_MODELS.items():
+        path = active_weights(detector, baseline)
+        installed = path.is_file()
+        candidate = latest_candidate(detector)
+        rows.append(model_readiness.inspect_detector(
+            detector, target, path, PROJECT_DIR,
+            quality=model_quality(detector, path) if installed else None,
+            digest=checkpoint_digest(path) if installed else None,
+            candidate=candidate[0] if candidate else None))
+    return rows
+
+
 def show_model_status():
     st.subheader("Model readiness")
-    st.caption("See which detectors are available and how their findings can be used.")
-    st.caption("Available checkpoints contribute detections under the assessment rules.")
-    rows = []
-    for detector, (baseline, _, _, _) in YOLO_MODELS.items():
-        path = active_weights(detector, baseline)
-        status = model_quality(detector, path) if path.is_file() else "missing"
-        rows.append({"Detector": detector, "Evaluation status": {"validated": "Validated", "provisional": "Provisional", "review_only": "Experimental", "missing": "Not installed"}[status],
-                     "Checkpoint": path.name, "SHA256": checkpoint_digest(path)[:12] if path.is_file() else ""})
-    st.dataframe(rows, hide_index=True)
+    st.caption("See which detectors are installed, how far each has been validated, and what to do next.")
+    st.caption("Missing, Experimental, Provisional and Validated are separate states. No detector status certifies a "
+               "complete contract.")
+    rows = model_readiness_rows()
+    totals = model_readiness.summary(rows)
+    st.markdown(f"**{totals['text']}**")
+    if note := model_readiness.no_checkpoint_note(rows):
+        notice(*note, icon=":material/block:")
+    st.dataframe([{"Detector": row["detector"], "Detects": row["target"], "Availability": row["availability"],
+                   "Eligibility": row["eligibility"], "How observations are used": row["use"],
+                   "Next action": row["next_action"]} for row in rows], hide_index=True,
+                 column_config={"Next action": st.column_config.TextColumn(width="large"),
+                                "How observations are used": st.column_config.TextColumn(width="large")})
     st.caption(f"Assessment policy {ASSESSMENT_VERSION} · inference format {INFERENCE_VERSION}")
     with st.expander("Technical details and release checks"):
-        st.code("python evaluate_checkpoint.py --help\npython promote_checkpoint.py --help", language="bash")
+        st.caption("Approval is bound to the checkpoint's SHA256 hash, not its file name or a finished training run.")
+        st.dataframe([{
+            "Detector": row["detector"], "Checkpoint": row["display_path"],
+            "Size": f"{row['size_bytes']:,} bytes" if row["size_bytes"] is not None else "Not installed",
+            "SHA256": row["sha256"] or "Not installed",
+            "Approval file": "Present" if row["approval_report"] else "None",
+            "Trained candidate": row["candidate"]["label"] if row["candidate"] else "None",
+            "Evaluation report": ("Present" if row["candidate"]["evaluation_report"] else "None") if row["candidate"] else "",
+        } for row in rows], hide_index=True)
+        present, absent = model_readiness.release_commands(PROJECT_DIR)
+        if present:
+            st.caption("Release checks available in this checkout. Evaluating and promoting are separate, explicit steps.")
+            st.code("\n".join(command for _, command in present), language="bash")
+        for script, _ in absent:
+            st.caption(f"{script} is not present in this checkout, so that release step cannot be run from here.")
 
 
 def open_assessment_db():
@@ -410,10 +509,17 @@ def open_assessment_db():
                 contract_id TEXT PRIMARY KEY, evidence_hash TEXT NOT NULL, reviewed_at TEXT NOT NULL,
                 reviewer TEXT NOT NULL
             )""")
+            review_store.ensure_schema(database)
+            queue_worker.ensure_schema(database)
     except sqlite3.Error:
         database.close()
         raise
     return database
+
+
+def open_assessment_db_readonly():
+    """Read-only handle for showing saved decisions and history. It cannot create tables or change a review."""
+    return sqlite3.connect(PHOTO_REVIEW_DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
 
 
 def assess_with_manual_review(record):
@@ -428,6 +534,9 @@ def assess_with_manual_review(record):
         override = database.execute(
             "SELECT category, note FROM manual_categories WHERE contract_id = ?", (record["contractId"],),
         ).fetchone()
+    if manual or override:
+        # Keep the automatic observation beside the human decision; the stored category stays the decision.
+        assessment["automatic_evidence_category"] = assessment["completion_evidence_category"]
     if manual:
         assessment["completion_evidence_category"] = "Completed · manual review"
         assessment["completion_assessment"] = "Marked completed by manual review"
@@ -451,14 +560,14 @@ def current_model_signature():
     })
 
 
-def review_is_stale(record):
+def review_is_stale(record, signature=None):
     return (record.get("assessment", {}).get("assessment_version") != ASSESSMENT_VERSION
-            or record.get("review_provenance", {}).get("models") != current_model_signature()
+            or record.get("review_provenance", {}).get("models") != (signature or current_model_signature())
             or record.get("assessment", {}).get("legacy_detection_format", False))
 
 
-def review_due(record, reviewed_at):
-    if review_is_stale(record):
+def review_due(record, reviewed_at, signature=None):
+    if review_is_stale(record, signature):
         return True
     days = 1 if (record.get("status") != "Completed" or not record.get("galleryPhotoCount")
                  or record.get("assessment", {}).get("retry_required")) else 7
@@ -488,7 +597,9 @@ def save_contract_assessments(summaries, *, require_saved=False):
     except (OSError, sqlite3.Error):
         if require_saved:
             raise
-        st.warning("The review finished, but its category could not be saved.")
+        error_state("The review finished, but its category could not be saved.",
+                    "The saved review database did not accept the update.",
+                    kept="The previously saved review is unchanged.")
 
 
 def refresh_inconclusive_reviews(database):
@@ -524,13 +635,22 @@ def refresh_inconclusive_reviews(database):
 @st.fragment
 def show_reviewed_contracts():
     if message := st.session_state.pop("saved_review_rerun_result", None):
-        st.success(message)
+        st.success(escape_markdown(message))  # contains contract IDs and reviewer text
     workspace = st.radio("Review view", ["Review workspace", "Saved groups"], horizontal=True) == "Review workspace"
     refresh = st.button("Refresh saved groups")
-    if st.session_state.pop("category_training_saved", False):
-        st.success("Moved the contract and saved the photo for YOLO training.")
-    if st.session_state.pop("training_example_saved", False):
-        st.success("Saved for the next training run in the YOLO Tester.")
+    # A saved decision (or a rerun that moved the contract) keeps that contract on screen, even though its
+    # group changed. Applied before the group and contract widgets exist, so their keys may be set.
+    follow = st.session_state.pop("saved_review_follow", None)
+    if follow:
+        st.session_state["saved_review_category"] = follow["category"]
+        st.session_state[f"saved_review_contract_{follow['category']}"] = follow["contract"]
+        if follow.get("queue_next"):
+            st.session_state["saved_review_next"] = {"for": follow["contract"], "group": follow["queue_group"],
+                                                     "contract": follow["queue_next"]}
+        else:
+            st.session_state.pop("saved_review_next", None)
+        if (st.session_state.get("saved_review_search") or "").strip().upper() not in follow["contract"].upper():
+            st.session_state["saved_review_search"] = ""
     try:
         with closing(open_assessment_db()) as database:
             if refresh:
@@ -539,41 +659,26 @@ def show_reviewed_contracts():
                 "SELECT category, COUNT(*) FROM contract_assessments GROUP BY category ORDER BY category"
             ).fetchall()
             if not groups:
-                st.info("Analyze a contract to save its completion evidence category here.")
+                empty_state("No saved reviews yet.",
+                            "Analyze a contract or run a regional review to save its photo evidence assessment here.",
+                            action_label="Go to Admin · Regional reviews", key="reviewed_empty_to_regional",
+                            on_click=partial(go_to, "Admin", admin_section="Regional reviews"),
+                            icon=":material/folder_open:")
                 return
             counts = dict(groups)
-            completion_groups = (
-                PHOTOS_BEFORE_COMPLETION,
-                NEUTRAL_REVIEW_CATEGORY,
-                "Completed · manual review",
-                *COMPLETION_TIMING_GROUPS,
-                "Possible unfinished work shown after reported completion",
-                "Completion not reported",
-                "Reported status unavailable",
-                "No photo evidence",
-                "Photo evidence unavailable",
-                "Photos inconclusive",
-            )
+            completion_groups = review_store.DECISION_CATEGORIES
             options = set(counts).union(completion_groups)
             if selected_group := st.session_state.get("saved_review_category"):
                 options.add(selected_group)
             options = sorted(options)
-            moved_group = st.session_state.pop("saved_review_moved_from", None)
-            if moved_group in options:
-                st.session_state["saved_review_category"] = moved_group
-            elif st.session_state.get("saved_review_category") not in options:
+            if st.session_state.get("saved_review_category") not in options:
                 st.session_state["saved_review_category"] = groups[0][0]
-            group = st.selectbox("Completion evidence group", options,
+            # Options stay raw stored values; only their display text is qualified.
+            group = st.selectbox("Saved evidence group", options,
                                  key="saved_review_category",
-                                 format_func=lambda label: f"{label} ({counts.get(label, 0):,})")
+                                 format_func=lambda raw: f"{language.category_label(raw)} ({counts.get(raw, 0):,})")
             search_key = "saved_review_search"
             search = (st.session_state.get(search_key) or "").strip() if workspace else ""
-            if moved_group == group and search and not database.execute("""
-                SELECT 1 FROM contract_assessments
-                WHERE category = ? AND instr(upper(contract_id), upper(?)) > 0 LIMIT 1
-            """, (group, search)).fetchone():
-                st.session_state[search_key] = ""
-                search = ""
             if workspace:
                 search = st.text_input("Find a contract by ID", placeholder="Enter all or part of a contract ID",
                                        key=search_key).strip()
@@ -583,112 +688,54 @@ def show_reviewed_contracts():
                 ORDER BY reviewed_at DESC, contract_id
             """, (group, search))]
             if not ids:
-                st.info("No contracts match this search." if search else f"No contracts remain in {group}.")
+                if search:
+                    empty_state("No contracts match this search.",
+                                f"No saved contract ID in {escape_markdown(language.category_label(group))} contains “{escape_markdown(search)}”. "
+                                "Check the ID or clear the search.", icon=":material/search_off:")
+                else:
+                    empty_state(f"No contracts remain in {language.category_label(group)}.",
+                                "Choose another saved evidence group.")
                 return
             navigation_key = f"saved_review_contract_{group}"
-            if next_contract := st.session_state.pop(f"advance_{navigation_key}", None):
-                st.session_state[navigation_key] = next_contract
             if st.session_state.get(navigation_key) not in ids:
                 st.session_state[navigation_key] = ids[0]
             position = ids.index(st.session_state[navigation_key])
             if workspace:
                 previous, counter, following = st.columns([1, 2, 1])
-                previous.button("Previous", disabled=position == 0, on_click=select_saved_contract,
+                previous.button("Previous in list", disabled=position == 0, on_click=select_saved_contract,
                                 args=(navigation_key, ids[max(0, position - 1)]))
                 counter.caption(f"{position + 1:,} of {len(ids):,} matching contracts")
-                following.button("Next", disabled=position == len(ids) - 1, on_click=select_saved_contract,
+                following.button("Next in list", disabled=position == len(ids) - 1, on_click=select_saved_contract,
                                  args=(navigation_key, ids[min(len(ids) - 1, position + 1)]))
             selected = st.selectbox("Saved contract", ids, key=navigation_key)
             row = database.execute(
                 "SELECT reviewed_at, summary FROM contract_assessments WHERE contract_id = ?", (selected,),
             ).fetchone()
     except (OSError, sqlite3.Error):
-        st.warning("Saved contract groups are unavailable.")
+        error_state("Saved contract groups are unavailable.", "The saved review database could not be read.",
+                    kept="No saved review was changed.", retry_label="Retry loading saved groups",
+                    key="retry_saved_groups")
         return
     if not row:
-        st.info("This saved review is unavailable. Refresh saved groups.")
+        empty_state("This saved review is unavailable.",
+                    "It may have moved to another group since this page loaded. Refresh saved groups to update the list.")
         return
     reviewed_at, payload = row
     record = json.loads(payload)
-    if review_is_stale(record):
-        st.warning("Saved review is stale: rules, checkpoints, or evidence format changed. Rerun to refresh.")
-    st.caption(EVIDENCE_LIMITATION)
     remaining = ids[position + 1:] or ids[:position]
-    advance = (navigation_key, remaining[0]) if remaining else None
-    if workspace:
-        st.subheader(selected)
-        if description := record.get("description"):
-            st.write(description)
-        details = st.columns(3)
-        details[0].caption(f"Reported status · {record.get('status') or 'Unavailable'}")
-        details[1].caption(f"Reported completion · {(record.get('dates') or {}).get('Reported completion') or 'Unavailable'}")
-        details[2].caption(f"Photos in review · {len(record['photos'])}")
-    st.caption(f"Last reviewed · {reviewed_at}")
-    with st.expander("Review provenance and previous revisions"):
-        st.json(record.get("review_provenance", {"status": "Legacy review; rerun required"}))
-        if provenance := record.get("assessment", {}).get("manual_review_provenance"):
-            st.json(provenance)
-        with closing(open_assessment_db()) as db:
-            history = db.execute("SELECT revision,category,reviewed_at,archived_at FROM review_history WHERE contract_id=? ORDER BY revision DESC LIMIT 20", (selected,)).fetchall()
-        if history:
-            st.dataframe([dict(zip(("Revision", "Category", "Reviewed", "Archived"), row)) for row in history], hide_index=True)
-    st.link_button("Open DPWH contract", project_url(selected))
-    if "coordinates" in record:
-        show_satellite_link(record, key="saved_satellite")
-    else:
-        try:
-            detail, _ = api_data(f"/projects/{quote(selected, safe='')}")
-        except (requests.RequestException, KeyError, ValueError):
-            detail = {}
-        show_satellite_link(detail, key="saved_satellite")
-    assessment = record["assessment"]
-    if timing := assessment.get("completion_photo_timing"):
-        st.caption(timing)
-    if st.button(
-        "Rerun review", key=f"rerun_saved_review_{selected}",
-    ):
-        try:
-            with st.spinner("Checking photos with the current YOLO checkpoints…"):
-                updated = summarize_contract(selected, save=False)
-                if updated["galleryPhotoCount"] is None:
-                    raise ValueError("Gallery unavailable")
-                save_contract_assessments([updated], require_saved=True)
-        except (requests.RequestException, OSError, sqlite3.Error, KeyError, ValueError):
-            st.warning("The review couldn’t be refreshed. Your previous review is still saved.")
-        else:
-            category = updated["assessment"]["completion_evidence_category"]
-            st.session_state["saved_review_rerun_result"] = f"{selected} · {category}"
-            if category != group:
-                advance_saved_review(advance, moved_from=group)
-            st.rerun()
-    work_evidence = record["assessment"].get("unfinished_work_evidence", {})
-    if work_evidence:
-        st.warning(f"Possible under construction · {len(work_evidence)} photo(s) on or after reported completion")
-    assessment["flags"] = list(dict.fromkeys([*assessment["flags"], *status_and_date_flags(record)]))
-    for flag in assessment["flags"]:
-        st.warning(flag)
-    if review := record.get("regional_review"):
-        st.write(review["summary"])
+    queue_state = {"contract": selected, "queue_group": group, "queue_next": remaining[0] if remaining else None}
+    services = review_services(
+        record, namespace="saved", stale=review_is_stale(record),
+        after_save=partial(follow_saved_decision, queue_state),
+        next_contract=queued_next(selected),
+        actions=partial(show_rerun_review, group, selected))
+    show_review_workspace(record, reviewed_at, services)
     if evidence := record["assessment"].get("manual_completion_evidence"):
         photo_path = PHOTO_REVIEW_DB.parent / "manual_evidence" / evidence
         if photo_path.is_file():
-            st.image(str(photo_path), caption="Manual completion evidence")
-    if workspace:
-        gallery, decision = st.columns([3, 2])
-        with gallery:
-            if record["photos"]:
-                show_training_feedback(record, categories=completion_groups, workspace=True, advance=advance,
-                                       work_evidence=work_evidence)
-            else:
-                st.info("No photos are saved with this review.")
-        with decision:
-            st.markdown("**Move to another review category**")
-            show_manual_category(record, completion_groups, advance=advance)
-    else:
-        with st.expander("Move to another review category"):
-            show_manual_category(record, completion_groups, advance=advance)
-        if record["photos"]:
-            show_training_feedback(record, categories=completion_groups, advance=advance, work_evidence=work_evidence)
+            st.image(str(photo_path), caption="Photo supplied with the manual decision")
+    if review := record.get("regional_review"):
+        st.text(language.relabel_text(review["summary"]))
     with st.expander("Saved contract details"):
         st.json(record)
 
@@ -697,183 +744,138 @@ def select_saved_contract(key, contract):
     st.session_state[key] = contract
 
 
-def save_manual_category(record, category, note):
-    contract = record["contractId"]
-    updated = {
-        **record, "assessment": {
-            **record["assessment"], "completion_evidence_category": category,
-            "completion_assessment": f"Manual review · {category}", "manual_category_note": note,
-        },
-    }
-    updated.pop("regional_review", None)
-    with closing(open_assessment_db()) as database, database:
-        database.execute("INSERT OR REPLACE INTO manual_categories VALUES (?, ?, ?)", (contract, category, note))
-        database.execute("INSERT OR REPLACE INTO manual_review_metadata VALUES (?, ?, ?, ?)",
-                         (contract, evidence_fingerprint(record), datetime.now(PHILIPPINE_TIME).isoformat(),
-                          os.environ.get("PROJECTWATCH_REVIEWER", "local reviewer")))
-        database.execute(
-            "UPDATE contract_assessments SET category = ?, reviewed_at = ?, summary = ? WHERE contract_id = ?",
-            (category, datetime.now(PHILIPPINE_TIME).isoformat(), json.dumps(updated, ensure_ascii=False), contract),
-        )
+def follow_saved_decision(follow, saved):
+    """After a decision is saved: keep showing that contract (its group may have changed) and remember
+    which contract comes next in the group the reviewer was working through. Navigation only."""
+    st.session_state["saved_review_follow"] = {**follow, "category": saved["category"]}
 
 
-def eligible_review_categories(record, categories, photo=None):
-    photos = record["photos"]
-    assessment = record["assessment"]
-    completion = reported_day((record.get("dates") or {}).get("Reported completion"))
-    capture_days = [day for item in photos if (day := reported_day(item.get("capturedAt")))]
-    captured = reported_day(photo.get("capturedAt")) if photo is not None else max(capture_days, default=None)
-    allowed = {"Photos inconclusive", NEUTRAL_REVIEW_CATEGORY} if photos else set()
-    if completion and capture_days and max(capture_days) < completion:
-        allowed.add(PHOTOS_BEFORE_COMPLETION)
-    if captured and completion and captured >= completion:
-        offset = (captured - completion).days
-        allowed.add("Completed · manual review")
-        allowed.add(completion_timing_group(offset))
-        if offset > 0:
-            allowed.add("Possible unfinished work shown after reported completion")
-    if not photos:
-        allowed.add("No photo evidence" if record.get("galleryPhotoCount") == 0 else "Photo evidence unavailable")
-    if not record.get("status"):
-        allowed.add("Reported status unavailable")
-    elif record["status"].casefold() != "completed":
-        allowed.add("Completion not reported")
-    return [category for category in categories if category in allowed and category != assessment["completion_evidence_category"]]
+def queued_next(contract):
+    """The Next contract action for a just-decided contract, or None when nothing else is queued."""
+    queued = st.session_state.get("saved_review_next")
+    if not queued or queued.get("for") != contract or not queued.get("contract"):
+        return None
+    return partial(go_to_queued_contract, queued)
 
 
-def show_manual_category(record, categories, *, advance=None):
-    contract = record["contractId"]
-    options = eligible_review_categories(record, categories)
-    if not options:
-        st.caption("No other category matches the saved evidence.")
-        return
-    with st.form(f"manual_category_{contract}"):
-        category = st.selectbox("Move to", options,
-                                index=None, placeholder="Choose a category")
-        note = st.text_input("Reason for the decision", value=record["assessment"].get("manual_category_note", ""))
-        if st.form_submit_button("Move contract"):
-            if not category or not note.strip():
-                st.warning("Choose a category and enter a reason.")
-                return
-            try:
-                save_manual_category(record, category, note.strip())
-            except (OSError, sqlite3.Error):
-                st.warning("The manual decision could not be saved.")
-                return
-            advance_saved_review(advance, moved_from=record["assessment"]["completion_evidence_category"])
+def go_to_queued_contract(queued):
+    group, contract = queued["group"], queued["contract"]
+    st.session_state["saved_review_category"] = group
+    st.session_state[f"saved_review_contract_{group}"] = contract
+    st.session_state.get("decision_receipts", {}).pop(queued["for"], None)
+    st.session_state.pop("saved_review_next", None)
 
 
-def advance_saved_review(advance, *, moved_from=None):
-    if moved_from:
-        st.session_state["saved_review_moved_from"] = moved_from
-    if advance:
-        key, contract = advance
-        st.session_state[f"advance_{key}"] = contract
-    st.rerun()
+automatic_category = review_store.automatic_category
+eligible_review_categories = review_store.eligible_review_categories
 
 
-def show_training_feedback(record, *, categories, workspace=False, advance=None, work_evidence=None):
-    contract = record["contractId"]
-    with st.expander("Review photo and label for YOLO" if workspace else "Label a photo for YOLO training", expanded=workspace):
-        number = st.selectbox("Reviewed photo", range(len(record["photos"])), key=f"review_training_photo_{contract}",
-                              format_func=lambda i: f"Photo {i + 1} · {record['photos'][i].get('capturedAt') or 'Date unknown'}")
-        source = record["photos"][number]
-        if cues := (work_evidence or {}).get(number + 1):
-            labels = [label for key, label in (
-                ("unfinished_work_detected", "unfinished work"),
-                ("scaffolding_detected", "scaffolding"),
-                ("equipment_detected", "construction equipment"),
-            ) if cues[key]]
-            st.warning("Possible under construction · " + ", ".join(labels))
-        if workspace:
-            st.link_button("Open original photo", source["url"])
-            if scope := source.get("scope"):
-                st.caption(scope)
-            for finding in source.get("yolo", []):
-                st.caption(finding["observation"])
-        detectors = category_detectors(source.get("category"), source.get("scope") or record.get("description"))
-        if not detectors:
-            detectors = tuple(YOLO_MODELS)
-        construction_detectors = {BUILDING_STAGE_DETECTOR, SCAFFOLDING_DETECTOR, EQUIPMENT_DETECTOR,
-                                  *(target[0] for target in UNFINISHED_TARGETS.values())}
-        detectors = tuple(detector for detector in detectors if detector not in construction_detectors)
-        detector = st.selectbox("Training detector", tuple(dict.fromkeys((*detectors, UNDER_CONSTRUCTION_TRAINING))))
-        if st.button("Load photo for labeling", key=f"label_photo_{contract}"):
-            try:
-                photo = download_photo(source["url"])
-            except (requests.RequestException, OSError, ValueError):
-                st.warning("The photo could not be loaded.")
-                return
-            st.session_state["training_review_photo"] = (source["url"], photo)
-        loaded = st.session_state.get("training_review_photo")
-        if not loaded or loaded[0] != source["url"]:
-            return
-        photo = loaded[1]
-        digest = sha256(f"{photo.size}".encode() + photo.tobytes()).hexdigest()
-        classes = UNDER_CONSTRUCTION_LABELS if detector == UNDER_CONSTRUCTION_TRAINING else YOLO_MODELS[detector][1]
-        saved = read_correction(detector, digest)
-        if saved:
-            st.caption("A correction for this photo and detector is saved.")
-        labels = ["", *classes]
-        if saved and saved["label"] not in labels and saved["label"] is not None:
-            saved = {**saved, "label": next(iter(classes))}
-        label = st.selectbox("Correct label", labels, index=labels.index(saved["label"] or "") if saved else None,
-                             format_func=lambda value: classes[value] if value else "No target visible",
-                             key=f"review_label_{detector}_{digest}")
-        points = []
-        append = False
-        if label:
-            if detector == UNDER_CONSTRUCTION_TRAINING and saved and saved["label"] == label:
-                st.caption(f"Saved outlines · {len(saved['polygons'])}")
-                append = st.checkbox("Add another outline", value=True, key=f"append_outline_{digest}")
-            polygon = saved["polygons"][-1] if saved and saved["label"] == label and not append else []
-            key = f"review_outline_{detector}_{digest}_{label}_{len(saved['polygons']) if append else 0}"
-            initial = [polygon[i:i + 2] for i in range(0, len(polygon), 2)]
-            state = st.session_state.get(key)
-            draft = state.get("points", initial) if isinstance(state, dict) else getattr(state, "points", initial)
-            st.caption("Click around the feature and select Use outline.")
-            points = outline_photo(photo, key, draft)
+def save_manual_category(record, category, note, reviewer=None):
+    """Record one reviewer decision (a new revision). Reviewer defaults to PROJECTWATCH_REVIEWER."""
+    reviewer = reviewer if reviewer is not None else os.environ.get("PROJECTWATCH_REVIEWER", "")
+    with closing(open_assessment_db()) as database:
+        return review_store.save_decision(database, record, category, note, reviewer)
+
+
+def review_overlay(photo, number):
+    """Detector overlays for one saved photo, {detector: image}. Empty when no checkpoint or the photo is unreadable.
+
+    Called only when the reviewer asks for the overlay; each result is cached by analyze_project_photo.
+    """
+    images = {}
+    for finding in photo.get("yolo") or []:
+        detector = finding.get("detector")
+        if finding.get("status") != "detected" or detector not in YOLO_MODELS or detector in images:
+            continue
+        weights = review_checkpoints(detector)[0]
+        if not weights.is_file():
+            continue
+        try:
+            with loading(f"Drawing the {detector} overlay"):
+                _, overlay = analyze_project_photo(photo["url"], detector, str(weights.resolve()),
+                                                   (INFERENCE_VERSION, checkpoint_digest(weights)))
+        except (ImportError, OSError, RuntimeError, ValueError, requests.RequestException):
+            continue
+        if overlay is not None:
+            images[detector] = overlay
+    return images
+
+
+def review_training_form(record, number):
+    """Training correction for the selected photo. A separate form: it never touches the decision."""
+    source = record["photos"][number - 1]
+    construction = {BUILDING_STAGE_DETECTOR, SCAFFOLDING_DETECTOR, EQUIPMENT_DETECTOR,
+                    *(target[0] for target in UNFINISHED_TARGETS.values())}
+    detectors = category_detectors(source.get("category"), source.get("scope") or record.get("description")) or tuple(YOLO_MODELS)
+    detectors = tuple(dict.fromkeys((*(d for d in detectors if d not in construction), UNDER_CONSTRUCTION_TRAINING)))
+    with st.expander("Training correction · saves a photo label, not a decision"):
+        render_training_correction(
+            record, number, detectors=detectors,
+            classes_for=lambda detector: UNDER_CONSTRUCTION_LABELS if detector == UNDER_CONSTRUCTION_TRAINING
+            else YOLO_MODELS[detector][1])
+
+
+def review_services(record, *, namespace, stale, after_save=None, next_contract=None, actions=None, detail=None):
+    documents = (lambda: show_cost_documents(detail)) if detail else None
+    satellite_source = detail if detail else record
+    return review_workspace.Services(
+        open_db=open_assessment_db, read_db=open_assessment_db_readonly, project_url=project_url, overlay=review_overlay,
+        training_form=review_training_form, review_stale=stale,
+        reviewer_default=os.environ.get("PROJECTWATCH_REVIEWER", ""), next_contract=next_contract,
+        after_save=after_save, actions=actions, documents=documents, namespace=namespace,
+        satellite=(lambda: show_satellite_link(satellite_source, key=f"{namespace}_satellite_{record['contractId']}"))
+        if satellite_location(satellite_source) else None)
+
+
+def show_review_workspace(record, reviewed_at, services, *, dates=None, amounts=None, source_checked=None, live_notes=()):
+    automatic, note = automatic_category(record)
+    record["assessment"]["flags"] = list(dict.fromkeys([*record["assessment"]["flags"], *status_and_date_flags(record)]))
+    review_workspace.render_contract_review(
+        record, reviewed_at=reviewed_at, services=services, automatic=automatic, automatic_note=note,
+        dates=dates if dates is not None else record.get("dates") or {},
+        amounts=amounts if amounts is not None else record.get("budgetPHP") or {},
+        source_checked=source_checked, live_notes=live_notes)
+
+
+def show_rerun_review(group, selected):
+    """Rerun the automatic review with the current detectors. A saved reviewer decision is kept."""
+    if st.button("Rerun review", key=f"rerun_saved_review_{selected}", icon=":material/refresh:",
+                 help="Checks the photos again with the current detectors. A saved reviewer decision is kept."):
+        try:
+            with loading("Retrieving photos and checking them with the current detectors"):
+                updated = summarize_contract(selected, save=False)
+                if updated["galleryPhotoCount"] is None:
+                    raise ValueError("Gallery unavailable")
+                save_contract_assessments([updated], require_saved=True)
+        except (requests.RequestException, OSError, sqlite3.Error, KeyError, ValueError):
+            error_state("The review couldn’t be refreshed.", "The source or the detectors did not respond.",
+                        kept="Your previous review is still saved.")
         else:
-            st.image(photo)
-        if st.checkbox("Also move this contract to another category", key=f"move_training_{contract}"):
-            options = eligible_review_categories(record, categories, source)
-            if not options:
-                st.caption("No other category matches the selected photo.")
-            destination = st.selectbox("Move to", options, disabled=not options,
-                                       index=None, key=f"training_destination_{contract}_{number}")
-            note = st.text_input("Reason for moving the contract", key=f"completion_training_note_{contract}")
-            if st.button("Move contract and save for YOLO", type="primary",
-                         disabled=not destination or label is None or (bool(label) and not points) or not note.strip()):
-                try:
-                    save_correction(detector, digest, photo, label or None, points, contract_id=contract, append=append)
-                except (OSError, ValueError) as error:
-                    st.warning(str(error))
-                    return
-                try:
-                    save_manual_category(
-                        {**record, "manual_review_photo": number + 1},
-                        destination, note.strip(),
-                    )
-                except (OSError, sqlite3.Error):
-                    st.warning("The training photo was saved. The category change could not be saved. Retry to finish.")
-                    return
-                st.session_state["category_training_saved"] = True
-                advance_saved_review(advance, moved_from=record["assessment"]["completion_evidence_category"])
-        st.caption("Save each labeled photo, then select another photo from this contract.")
-        save_buttons = st.columns(2)
-        label_pending = label is None or (bool(label) and not points)
-        save_photo = save_buttons[0].button("Save YOLO training example", disabled=label_pending)
-        save_and_next = save_buttons[1].button("Save and go to next contract",
-                                               disabled=label_pending or not advance)
-        if save_photo or save_and_next:
-            try:
-                save_correction(detector, digest, photo, label or None, points, contract_id=contract, append=append)
-                if save_and_next:
-                    st.session_state["training_example_saved"] = True
-                    advance_saved_review(advance)
-                st.success("Saved for the next training run in the YOLO Tester.")
-            except (OSError, ValueError) as error:
-                st.warning(str(error))
+            category = updated["assessment"]["completion_evidence_category"]
+            st.session_state["saved_review_rerun_result"] = f"Review refreshed for {selected} · {language.category_label(category)}"
+            review_workspace.forget_seen_evidence(selected)  # the reviewer asked for, and now sees, the new evidence
+            if category != group:
+                st.session_state["saved_review_follow"] = {"contract": selected, "category": category,
+                                                           "queue_group": None, "queue_next": None}
+            st.rerun()
+
+
+def show_cost_documents(detail):
+    links = detail.get("links") or {}
+    documents = {"programOfWork": "Program of Work", "advertisement": "Bid documents",
+                 "contractAgreement": "Contract agreement"}
+    available = []
+    for key, label in documents.items():
+        url = links.get(key) or ""
+        parsed = urlsplit(url)
+        if parsed.scheme == "https" and parsed.netloc:
+            available.append((label, url))
+    if available:
+        st.caption("Check the linked documents for an itemized breakdown.")
+        for label, url in available:
+            st.link_button(label, url)
+    else:
+        st.caption("The API lists no costing documents for this contract.")
 
 
 @st.cache_data(ttl=45, max_entries=128, show_spinner=False)
@@ -905,13 +907,151 @@ def check_photo_availability(contract_ids):
 def reset_live_page():
     st.session_state["live_page"] = 1
     st.session_state["project_page_picker"] = 1
+    st.session_state.pop("live_list_shown", None)
 
 
 def reset_project_filters():
-    for key in ("live_search", "live_region", "live_category", "live_status", "live_year",
-                "live_photos_only", "live_limit", "live_contract"):
+    # The fiscal year returns to its explicit default (current year), not to "All years". The result view
+    # (table or list) and the detail-column choice are preferences, not filters, so they stay.
+    # Widgets get their default values explicitly. Popping their keys is not enough: the browser still holds
+    # the old values and sends them back on the next rerun (found in the phase 4 rendered check).
+    defaults = {"live_search": "", "live_region": None, "live_category": None, "live_status": None,
+                "live_year": fiscal_year_options()[0], "live_photos_only": False, "live_limit": 100,
+                "live_open_choice": None}
+    for key, value in defaults.items():
+        st.session_state[key] = value
+    for key in ("live_contract", "live_last_opened"):
         st.session_state.pop(key, None)
     reset_live_page()
+
+
+# Explore state that must survive reruns, page switches and the contract detail view. live_last_opened and
+# live_last_result are plain session values (not widgets) and persist without re-pinning.
+LIVE_STATE_KEYS = ("live_search", "live_region", "live_category", "live_status", "live_year", "live_photos_only",
+                   "live_limit", "live_page", "live_contract", "project_page_picker", "live_open_choice",
+                   "live_view", "live_detail_columns", "live_list_shown")
+LIVE_LIST_STEP = 25  # list view renders contract cards in steps so a 500-row page stays light
+
+
+def shorten(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def default_filters_only():
+    """True on the initial view: nothing chosen except the default fiscal year."""
+    state = st.session_state
+    return (not (state.get("live_search") or "").strip()
+            and (state.get("live_year") or fiscal_year_options()[0]) == fiscal_year_options()[0]
+            and not any(state.get(key) for key in ("live_region", "live_category", "live_status", "live_photos_only")))
+
+
+def fiscal_year_options():
+    current_year = datetime.now(PHILIPPINE_TIME).year
+    return [*(str(year) for year in range(current_year, 2015, -1)), "All years"]
+
+
+def active_filter_summary():
+    """The filters behind the current results, in words. The default fiscal year is stated explicitly."""
+    state = st.session_state
+    default_year = fiscal_year_options()[0]
+    year = state.get("live_year") or default_year
+    parts = ["All fiscal years" if year == "All years" else
+             f"Fiscal year {year}" + (" (default)" if year == default_year else "")]
+    parts.append(state.get("live_region") or "All regions")
+    if state.get("live_category"):
+        parts.append(state["live_category"])
+    if state.get("live_status"):
+        parts.append(f"Reported status {state['live_status']}")
+    if state.get("live_photos_only"):
+        parts.append("Only contracts with photos")
+    if search := (state.get("live_search") or "").strip():
+        parts.append(f"Search “{search}”")
+    return parts
+
+
+def open_live_contract(contract_id):
+    # Remember where the user came from: Back to results re-selects this contract in the table, the
+    # Contract to open picker and the list view (plan §5A, Law 11).
+    if contract_id:
+        st.session_state["live_contract"] = contract_id
+        st.session_state["live_last_opened"] = contract_id
+        st.session_state["live_open_choice"] = contract_id
+
+
+def open_chosen_contract():
+    open_live_contract(st.session_state.get("live_open_choice"))
+
+
+def close_live_contract():
+    st.session_state["live_contract"] = None
+    st.session_state["live_returned"] = True  # one-time "You were viewing …" note on the results
+
+
+def refresh_live_results():
+    api_data.clear()
+
+
+def saved_review_index(contract_ids):
+    """Read-only lookup of saved photo assessments for listed contracts. Never runs analysis or writes."""
+    if not contract_ids or not PHOTO_REVIEW_DB.is_file():
+        return {}
+    try:
+        uri = PHOTO_REVIEW_DB.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as database:
+            marks = ",".join("?" * len(contract_ids))
+            rows = database.execute(
+                f"SELECT contract_id, category, reviewed_at FROM contract_assessments WHERE contract_id IN ({marks})",
+                tuple(contract_ids),
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {contract: (category, reviewed_at) for contract, category, reviewed_at in rows}
+
+
+def saved_review_record(contract):
+    """Read-only: (reviewed_at, saved record) for one contract, None if not saved. Raises sqlite3.Error/ValueError."""
+    if not PHOTO_REVIEW_DB.is_file():
+        return None
+    uri = PHOTO_REVIEW_DB.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=5)) as database:
+        row = database.execute("SELECT reviewed_at, summary FROM contract_assessments WHERE contract_id = ?",
+                               (contract,)).fetchone()
+    if not row:
+        return None
+    return row[0], json.loads(row[1])
+
+
+def show_saved_assessment(contract, detail):
+    """Explore detail: the saved photo assessment, read-only and separate from the live source record."""
+    st.subheader("Photo evidence assessment")
+    try:
+        saved = saved_review_record(contract)
+    except (sqlite3.Error, ValueError):
+        error_state("Saved photo assessment could not be read.", "The saved review database did not respond.",
+                    kept="The source record and photos below are unaffected. Try again later.")
+        return
+    if not saved or not isinstance(saved[1].get("assessment"), dict):
+        show_state("no_saved_assessment")
+        st.caption(f"Reported status · {detail.get('status') or 'Unavailable'} (from the source record; not a photo assessment)")
+        return
+    reviewed_at, record = saved
+    st.caption("Saved review, shown read-only. Opening a contract here never reruns or changes it. "
+               "Reported status below is the value saved with the review; the live record above may be newer.")
+    if review_is_stale(record):
+        show_state("stale")
+    automatic, note = automatic_category(record)
+    evidence_overview(record, record["assessment"], automatic, reviewed_at=reviewed_at, automatic_note=note)
+
+
+def review_date(value):
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return "Date unknown"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=PHILIPPINE_TIME)
+    return f"{moment.astimezone(PHILIPPINE_TIME):%d %b %Y}"
 
 
 def project_pagination(page, total_pages):
@@ -940,150 +1080,331 @@ def select_project_page():
 def select_contract_from_table(table_key, contract_ids):
     selected_rows = st.session_state[table_key]["selection"]["rows"]
     if selected_rows:
-        st.session_state["live_contract"] = contract_ids[selected_rows[0]]
+        open_live_contract(contract_ids[selected_rows[0]])
 
 
 def status_cell_style(status):
-    light = getattr(st.context, "theme", {}).get("type") == "light"
-    colors = {
-        "Completed": ("#4ADE80", "#166534", "#163328", "#DEF5E7"),
-        "On-Going": ("#FBBF24", "#854D0E", "#362C18", "#FFF1D1"),
-        "Not Yet Started": ("#A1B1C8", "#40546C", "#243146", "#E8EFF6"),
-        "For Procurement": ("#38BDF8", "#075985", "#153347", "#DFF3FC"),
-    }
-    if status in colors:
-        dark_text, light_text, dark_background, light_background = colors[status]
-        return f"color:{light_text if light else dark_text};background-color:{light_background if light else dark_background};font-weight:600"
-    return ""
+    # Reported status is a source fact, not evidence: no colour coding (§4.4), the text carries the meaning.
+    # Weight only, so the cell stays readable in both themes without relying on st.context.theme.
+    return "font-weight:600" if status in API_STATUSES else ""
 
 
-@st.fragment(run_every=REFRESH_INTERVAL_SECONDS)
+# Explore refreshes on demand ("Refresh results"), not on a timer: a timed rerun of an open contract
+# repeated photo analysis after cache expiry and could disturb typing or selection (plan §5A, Law 25).
+@st.fragment
 def show_live_projects():
-    kpis = st.empty()
+    # Re-pin Explore state: fragment reruns drop values of widgets that are not rendered (e.g. the
+    # filters while a contract is open), and the detail view must return to the same results.
+    for key in LIVE_STATE_KEYS:
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+    if contract := st.session_state.get("live_contract"):
+        show_live_contract(contract)
+    else:
+        show_live_results()
+
+
+def show_live_search():
+    """Search first: ID/description, Region and Fiscal year visible; the rest under More filters."""
     with st.container(border=True):
-        title, reset = st.columns([3, 1], vertical_alignment="center")
-        title.subheader("Find a project")
-        reset.button("Reset filters", on_click=reset_project_filters)
+        st.subheader("Find a contract")
         search = st.text_input(
             "Contract ID or project description", placeholder="e.g. 24CK0181 or riverbank protection",
             key="live_search", on_change=reset_live_page, icon=":material/search:",
         )
-        filters = st.columns(5)
-        current_year = datetime.now(PHILIPPINE_TIME).year
-        region = filters[0].selectbox("Region", [None, *API_REGIONS], format_func=lambda value: value or "All regions", on_change=reset_live_page, key="live_region")
-        category = filters[1].selectbox("Infrastructure category", [None, *API_CATEGORIES], format_func=lambda value: value or "All categories", on_change=reset_live_page, key="live_category")
-        status = filters[2].selectbox("Project status", [None, *API_STATUSES], format_func=lambda value: value or "All statuses", on_change=reset_live_page, key="live_status")
-        year = filters[3].selectbox(
-            "Fiscal year", [*(str(year) for year in range(current_year, 2015, -1)), "All years"],
-            on_change=reset_live_page, key="live_year",
-        )
-        photos_only = st.toggle("Only show contracts with photos", on_change=reset_live_page, key="live_photos_only")
-        if photos_only:
-            st.session_state["live_limit"] = 50
-        elif "live_limit" not in st.session_state:
-            st.session_state["live_limit"] = 100
-        limit = filters[4].selectbox(
-            "Per page", [50] if photos_only else [50, 100, 200, 500], index=0,
-            on_change=reset_live_page, disabled=photos_only, key="live_limit",
-        )
-    page = st.session_state.get("live_page", 1)
-    params = {
-        "page": page, "limit": limit, "year": None if year == "All years" else year, "region": region,
-        "category": category, "status": status, "search": search.strip() or None,
-    }
-    try:
-        result, checked_at = api_data("/projects", params)
-    except (requests.RequestException, KeyError, ValueError):
-        st.error("The BetterGov API is unavailable. Please try again in a moment.")
-        return
+        region_column, year_column = st.columns(2)
+        region = region_column.selectbox("Region", [None, *API_REGIONS], format_func=lambda value: value or "All regions",
+                                         on_change=reset_live_page, key="live_region")
+        year = year_column.selectbox("Fiscal year", fiscal_year_options(), on_change=reset_live_page, key="live_year")
+        with st.expander("More filters"):
+            category = st.selectbox("Infrastructure category", [None, *API_CATEGORIES],
+                                    format_func=lambda value: value or "All categories", on_change=reset_live_page,
+                                    key="live_category")
+            status = st.selectbox("Reported status", [None, *API_STATUSES], format_func=lambda value: value or "All statuses",
+                                  on_change=reset_live_page, key="live_status")
+            photos_only = st.toggle("Only show contracts with photos", on_change=reset_live_page, key="live_photos_only")
+            if photos_only:
+                st.session_state["live_limit"] = 50
+            elif "live_limit" not in st.session_state:
+                st.session_state["live_limit"] = 100
+            limit = st.selectbox("Results per page", [50] if photos_only else [50, 100, 200, 500],
+                                 on_change=reset_live_page, disabled=photos_only, key="live_limit",
+                                 help="Photo checks run on 50 contracts at a time." if photos_only else None)
+        show_active_filters()
+        st.button("Reset filters", on_click=reset_project_filters, key="reset_live_filters",
+                  help=f"Clears every filter and returns to fiscal year {fiscal_year_options()[0]}.")
+    return {"page": st.session_state.get("live_page", 1), "limit": limit,
+            "year": None if year == "All years" else year, "region": region, "category": category,
+            "status": status, "search": search.strip() or None}, photos_only
 
+
+def show_active_filters():
+    """Active filters as a labelled list of chips (text, not colour). The default fiscal year is named."""
+    # st.html, not markdown: the search text is user input and is HTML-escaped only (no markdown parsing).
+    chips = "".join(f'<span class="bant-chip" role="listitem">{html.escape(part)}</span>'
+                    for part in active_filter_summary())
+    st.html(f'<div class="bant-filters"><span class="bant-filters-label" id="live-active-filters">Active filters'
+            f'</span> <span role="list" aria-labelledby="live-active-filters">{chips}</span></div>')
+
+
+def fetch_live_results(params):
+    """(result, checked_at, stale) or None after reporting an outage.
+
+    A failed request keeps the last successful results for the same filters and page on screen, labelled
+    with the time they were checked, instead of discarding them (plan §8 Source/API outage).
+    """
+    request_key = fingerprint(params)
+    try:
+        with loading("Loading matching contracts from the DPWH source"):
+            result, checked_at = api_data("/projects", params)
+        pagination = result["pagination"]
+        result = {"data": list(result["data"]),
+                  "pagination": {"totalCount": int(pagination["totalCount"]),
+                                 "totalPages": int(pagination["totalPages"])}}
+    except (requests.RequestException, KeyError, TypeError, ValueError):
+        last = st.session_state.get("live_last_result")
+        if last and last[0] == request_key:
+            error_state("The source is unavailable.", "The BetterGov API did not respond to the latest refresh.",
+                        kept=f"Your filters and page are kept. The results below are from the last successful check, "
+                             f"{language.format_timestamp(last[2])}. Saved reviews are unaffected.")
+            return last[1], last[2], True
+        error_state("The source is unavailable.", "The BetterGov API did not respond.",
+                    kept="Your filters and page are kept. Saved reviews are unaffected.",
+                    retry_label="Refresh results", on_retry=refresh_live_results, key="refresh_live_results_failed")
+        return None
+    st.session_state["live_last_result"] = (request_key, result, checked_at)
+    return result, checked_at, False
+
+
+def show_live_results():
+    params, photos_only = show_live_search()
+    page = params["page"]
+    fetched = fetch_live_results(params)
+    if fetched is None:
+        return
+    result, checked_at, stale = fetched
     pagination = result["pagination"]
-    count_label = "matching contracts before checking photos" if photos_only else "matching contracts"
-    results_count, checked = st.columns([3, 2], vertical_alignment="center")
-    results_count.subheader(f"{pagination['totalCount']:,} {count_label}")
-    checked.html(f'<span class="bant-live" aria-hidden="true"></span>Last checked {checked_at:%d %b %Y, %H:%M:%S %Z}')
     if page > max(1, pagination["totalPages"]):
         reset_live_page()
-        st.rerun()
-    with kpis.container():
-        cards = st.columns(4)
-        statuses = Counter(project.get("status") for project in result["data"])
-        budgets = pd.to_numeric(pd.Series([project.get("budget") for project in result["data"]]), errors="coerce")
-        cards[0].metric("Matching contracts", f"{pagination['totalCount']:,}", help="Before filtering galleries for photos.")
-        cards[1].metric("Completed · API page", f"{statuses['Completed']:,}")
-        cards[2].metric("On-going · API page", f"{statuses['On-Going']:,}")
-        cards[3].metric("Reported budget · API page", format_peso(budgets.sum(min_count=1)))
+        st.rerun(scope="fragment")
+
+    total = pagination["totalCount"]
+    # The heading is the source's count of matching records. In photos-only mode it is stated as the count
+    # before any photo check, and the checked/shown numbers for this page are reported separately below.
+    st.subheader(f"{total:,} matching contract{'' if total == 1 else 's'}"
+                 + (" before photo check" if photos_only else ""))
+    freshness("Source last checked" if stale else "Source checked", checked_at)
+    if default_filters_only():
+        st.caption(f"Showing every contract for fiscal year {fiscal_year_options()[0]}. Search by contract ID or "
+                   "project description to narrow the list.")
+    st.caption("Results update when you change filters or select Refresh results; nothing refreshes on a timer.")
+    st.button("Refresh results", key="refresh_live_results", on_click=refresh_live_results,
+              icon=":material/refresh:", type="tertiary")
     if not result["data"]:
-        st.info("No contracts match these filters.")
+        empty_state("No contracts match these filters.",
+                    "Active filters · " + " · ".join(escape_markdown(part) for part in active_filter_summary())
+                    + ". Change a filter or reset them all.",
+                    action_label="Reset filters", on_click=reset_project_filters, key="reset_live_filters_empty",
+                    icon=":material/search_off:")
         project_pagination(page, pagination["totalPages"])
         return
 
     projects = result["data"]
+    statuses = Counter(project.get("status") for project in projects)
+    budgets = pd.to_numeric(pd.Series([project.get("budget") for project in projects]), errors="coerce")
+    st.caption(
+        f"Page {page:,} lists {len(projects):,} of {total:,} matching records"
+        + (" (before photo check)" if photos_only else "")
+        + f" · {statuses['Completed']:,} reported completed · {statuses['On-Going']:,} reported on-going · "
+        f"reported budget {format_peso(budgets.sum(min_count=1))} across {int(budgets.notna().sum()):,} "
+        f"record{'' if int(budgets.notna().sum()) == 1 else 's'} with an amount. Status and budget are as published in the source."
+    )
     if photos_only:
-        st.caption("Photo availability is checked for up to 50 contracts on each results page.")
-        with st.spinner("Checking project galleries"):
-            availability = check_photo_availability(tuple(project["contractId"] for project in projects))
-        projects = [project for project in projects if availability[project["contractId"]] is True]
-        st.caption(f"{len(projects):,} contracts with photos on this page.")
-        unchecked = sum(status is None for status in availability.values())
-        if unchecked:
-            st.warning(f"Photo availability could not be verified for {unchecked:,} contracts on this page.")
+        projects = show_photo_check(projects, total)
         if not projects:
-            st.info("No contracts with confirmed photos on this page. Try another results page or change your filters.")
+            empty_state("No contracts with confirmed photos on this page.",
+                        "Try the next results page or change your filters.", icon=":material/hide_image:")
             project_pagination(page, pagination["totalPages"])
             return
+    show_live_matches(projects)
+    project_pagination(page, pagination["totalPages"])
 
-    rows = pd.DataFrame(projects)
+
+def show_photo_check(projects, total):
+    """Photos-only: check this page's galleries and keep the four counts apart (plan §5A)."""
+    with loading("Checking project galleries for photos"):
+        availability = check_photo_availability(tuple(project["contractId"] for project in projects))
+    shown = [project for project in projects if availability[project["contractId"]] is True]
+    unchecked = sum(status is None for status in availability.values())
+    counts = [("Matching records", total, "Records that match your filters in the source, before any photo check."),
+              ("Checked on this page", len(projects), "Only this results page is checked for photos."),
+              ("With photos, shown", len(shown), "Contracts on this page whose gallery has at least one photo.")]
+    if unchecked:
+        counts.append(("Could not be checked", unchecked, "The gallery source did not answer for these contracts."))
+    for column, (label, value, note) in zip(st.columns(len(counts)), counts):
+        column.metric(label, f"{value:,}", help=note)
+    if unchecked:
+        error_state(f"Photo availability could not be verified for {unchecked:,} contracts on this page.",
+                    "The gallery source did not answer for them, so they are left out of this photos-only list.",
+                    kept="Turn off Only show contracts with photos to list every matching contract.")
+    return shown
+
+
+def result_rows(projects):
+    """One row per contract, newest reported completion first. Only source fields and saved reviews:
+    nothing here fetches photos or runs analysis."""
+    rows = pd.DataFrame(projects).reindex(columns=["contractId", "description", "location", "status",
+                                                   "completionDate", "budget", "category", "infraType"])
     rows["completionDate"] = pd.to_datetime(rows["completionDate"], format="ISO8601", errors="coerce")
     rows = rows.sort_values("completionDate", ascending=False, na_position="last", kind="stable")
-    rows["completionDate"] = rows["completionDate"].dt.date
-    st.caption("This page is sorted by reported completion date, newest first.")
-    rows["region"] = rows["location"].map(lambda location: (location or {}).get("region"))
-    rows["budget"] = pd.to_numeric(rows.get("budget", pd.NA), errors="coerce")
-    fiscal_years = rows.reindex(columns=["infraYear"])["infraYear"]
-    rows["infraYear"] = pd.to_numeric(fiscal_years, errors="coerce").astype("Int64")
-    result_columns = [
-        "contractId", "description", "contractor", "infraYear", "region", "status",
-        "completionDate", "budget",
-    ]
     contract_ids = tuple(rows["contractId"])
-    table_key = f"contract_results_{hash(contract_ids)}"
-    st.caption("Select a project row to open its details below. The contract link opens the original DPWH record.")
-    display_rows = rows.reindex(columns=result_columns).assign(contractId=rows["contractId"].map(project_url))
-    display_rows = display_rows.fillna({field: "—" for field in ("description", "contractor", "region", "status")})
+    reviews = saved_review_index(contract_ids)
+    return pd.DataFrame({
+        "id": contract_ids,
+        "project": rows["description"].fillna("Description unavailable").tolist(),
+        "region": [(location.get("region") or "—") if isinstance(location, dict) else "—"
+                   for location in rows["location"]],
+        "status": rows["status"].fillna("Unavailable").tolist(),
+        "evidence": [language.category_label(reviews[c][0]) if c in reviews else "Not reviewed" for c in contract_ids],
+        "reviewed": [review_date(reviews[c][1]) if c in reviews else "—" for c in contract_ids],
+        "completion": [f"{value:%d %b %Y}" if pd.notna(value) else "—" for value in rows["completionDate"]],
+        "budget": [format_peso(value) if pd.notna(value) else "—"
+                   for value in pd.to_numeric(rows["budget"], errors="coerce")],
+        "category": [next((v for v in (category, infra) if isinstance(v, str) and v.strip()), "—")
+                     for category, infra in zip(rows["category"], rows["infraType"])],
+    })
+
+
+def show_live_matches(projects):
+    rows = result_rows(projects)
+    last_opened = st.session_state.get("live_last_opened")
+    if st.session_state.pop("live_returned", False) and last_opened in tuple(rows["id"]):
+        notice(f"You were viewing {last_opened}.", "It stays selected below, so you can continue from where you were.",
+               icon=":material/history:")
+    view_column, detail_column = st.columns([1, 1], vertical_alignment="bottom")
+    view = view_column.radio("Show results as", ["Table", "List"], horizontal=True, key="live_view",
+                             help="List shows each contract as a card with its own Open contract button; "
+                                  "it suits narrow screens and screen magnifiers.")
+    if view == "List":
+        show_live_list(rows)
+    else:
+        details = detail_column.toggle("Add detail columns", key="live_detail_columns",
+                                        help="Adds reported completion date, reported budget and category.")
+        show_live_table(rows, details=details)
+
+
+def show_live_table(rows, *, details=False):
+    contract_ids = tuple(rows["id"])
+    table = pd.DataFrame({
+        # Plan §5A column order; ID and project share one pinned column so identity stays visible
+        # when narrower layouts (e.g. 1024 px with the sidebar) need the table to scroll sideways.
+        "Contract ID / project": [f"{contract} · {text}" for contract, text in zip(contract_ids, rows["project"])],
+        "Region": rows["region"], "Reported status": rows["status"],
+        "Photo evidence": rows["evidence"], "Last reviewed": rows["reviewed"],
+    })
+    column_config = {
+        # Widths sum to about 900 px: no sideways scrolling at 1440 px; narrower layouts scroll with the
+        # first column pinned.
+        "Contract ID / project": st.column_config.TextColumn("Contract ID / project", width=300, pinned=True),
+        "Region": st.column_config.TextColumn("Region", width=140),
+        "Reported status": st.column_config.TextColumn("Reported status", width=115,
+                                                       help="As published in the DPWH record; not a photo finding."),
+        "Photo evidence": st.column_config.TextColumn("Photo evidence", width=210,
+                                                      help="Saved automatic photo assessment or reviewer decision."),
+        "Last reviewed": st.column_config.TextColumn("Last reviewed", width=95,
+                                                     help="When the photo review was saved. Not the source check time."),
+    }
+    if details:
+        # Detail columns come after the planned hierarchy; the table then scrolls with the first column pinned.
+        table["Reported completion"] = rows["completion"]
+        table["Reported budget"] = rows["budget"]
+        table["Category"] = rows["category"]
+        column_config.update({
+            "Reported completion": st.column_config.TextColumn("Reported completion", width=110),
+            "Reported budget": st.column_config.TextColumn("Reported budget", width=140),
+            "Category": st.column_config.TextColumn("Category", width=180),
+        })
+    st.caption("Sorted by reported completion date, newest first. Photo evidence and Last reviewed come from saved "
+               "reviews. Select a row's checkbox, or choose a contract below and use Open contract. — means the "
+               "value is not in the record.")
+    table_key = f"contract_results_{fingerprint(contract_ids)}"
+    last_opened = st.session_state.get("live_last_opened")
     st.dataframe(
-        display_rows.style.map(status_cell_style, subset=["status"]),
-        hide_index=True,
-        key=table_key,
-        selection_mode="single-row",
+        table.style.map(status_cell_style, subset=["Reported status"]),
+        hide_index=True, key=table_key, selection_mode="single-row",
+        # Restores the row the user came back from; applied only when the table has no stored selection.
+        selection_default={"selection": {"rows": [contract_ids.index(last_opened)]}}
+        if last_opened in contract_ids else None,
         on_select=lambda: select_contract_from_table(table_key, contract_ids),
-        column_config={
-            "contractId": st.column_config.LinkColumn("Contract ID", display_text=r"[?]project=([^&]+)"),
-            "description": st.column_config.TextColumn("Project", width=340),
-            "contractor": st.column_config.TextColumn("Contractor", width=180), "region": "Region", "status": "Status",
-            "infraYear": st.column_config.NumberColumn("Fiscal year", format="%d"),
-            "completionDate": st.column_config.DateColumn("Reported completion", format="YYYY-MM-DD"),
-            "budget": st.column_config.NumberColumn("Reported budget (PHP)", format="₱%.2f"),
-        },
+        column_config=column_config,
     )
-    if st.session_state.get("live_contract") not in contract_ids:
-        st.session_state["live_contract"] = None
-    project_pagination(page, pagination["totalPages"])
-    with st.container(border=True):
-        contract = st.selectbox("Review a contract", contract_ids, index=None, key="live_contract")
-    if contract is None:
-        return
+    descriptions = dict(zip(contract_ids, rows["project"]))
+    if st.session_state.get("live_open_choice") not in contract_ids:
+        st.session_state["live_open_choice"] = None
+    # Control and its action stack (no narrow side column): labels never truncate at any width.
+    chosen = st.selectbox(
+        "Contract to open", contract_ids, index=None, key="live_open_choice",
+        placeholder="Choose a contract from this page",
+        format_func=lambda contract: f"{contract} · {shorten(descriptions[contract], 70)}",
+    )
+    st.button("Open contract", type="primary", key="open_live_contract", on_click=open_chosen_contract,
+              disabled=chosen is None)
+
+
+def show_more_list_items(count):
+    st.session_state["live_list_shown"] = count
+
+
+def show_live_list(rows):
+    """Compact, accessible alternative to the wide table: one card per contract, full project text,
+    labelled facts and a button named for its contract. Cards render in steps of LIVE_LIST_STEP."""
+    ids = list(rows["id"])
+    shown = max(LIVE_LIST_STEP, st.session_state.get("live_list_shown") or 0)
+    last_opened = st.session_state.get("live_last_opened")
+    if last_opened in ids:
+        shown = max(shown, ids.index(last_opened) + 1)  # the contract the user came back from is always shown
+    shown = min(shown, len(ids))
+    st.caption(f"Sorted by reported completion date, newest first · showing {shown:,} of {len(ids):,} on this page.")
+    for row in rows.head(shown).itertuples(index=False):
+        with st.container(border=True, key=f"live_card_{row.id}"):
+            st.markdown(f"**{escape_markdown(row.id)}**"
+                        + (" · :material/history: last opened" if row.id == last_opened else ""))
+            st.text(row.project)  # external text, never markdown
+            st.caption(f"Region: {escape_markdown(row.region)} · Reported status: {escape_markdown(row.status)}  \n"
+                       f"Photo evidence: {escape_markdown(row.evidence)} · "
+                       f"Last reviewed: {escape_markdown(row.reviewed)}")
+            st.button(f"Open contract {row.id}", key=f"open_card_{row.id}", on_click=open_live_contract,
+                      args=(row.id,))
+    if shown < len(ids):
+        more = min(LIVE_LIST_STEP, len(ids) - shown)
+        st.button(f"Show {more:,} more on this page", key="live_list_more", on_click=show_more_list_items,
+                  args=(shown + more,))
+
+
+def show_live_contract(contract):
+    back, source = st.columns([1, 1], vertical_alignment="center")
+    back.button("Back to results", icon=":material/arrow_back:", key="live_back_to_results", on_click=close_live_contract)
+    with source:
+        st.link_button("Open source record", project_url(contract), icon=":material/open_in_new:")
+    st.caption(f"Explore projects / {escape_markdown(contract)} · results kept: "
+               + " · ".join(escape_markdown(part) for part in active_filter_summary())
+               + f" · page {st.session_state.get('live_page', 1):,}")
+    saved = saved_review_index((contract,)).get(contract)
     path = f"/projects/{quote(contract, safe='')}"
     try:
-        detail, _ = api_data(path)
+        detail, checked_at = api_data(path)
     except (requests.RequestException, KeyError, ValueError):
-        st.warning("The API could not load this contract's details.")
-        st.link_button("Open DPWH contract", project_url(contract))
+        kept = (f"Your previous saved review is retained · {language.category_label(saved[0])} · saved "
+                f"{language.format_timestamp(saved[1])}." if saved else "Your results and filters are kept.")
+        error_state("The source is unavailable.", "This contract's record could not be loaded.", kept=kept,
+                    retry_label="Retry loading contract", on_retry=refresh_live_results,
+                    key=f"retry_live_contract_{contract}")
+        if saved:
+            show_saved_assessment(contract, {})
         return
-
     summary = detail.get("imageSummary") or {}
     project = pd.DataFrame([{
-        "contractId": contract, "description": detail["description"], "status": detail["status"],
+        "contractId": contract, "description": detail.get("description"), "status": detail.get("status"),
         "contractor": detail.get("contractor"),
         "completionDate": pd.to_datetime(detail.get("completionDate"), errors="coerce"),
     }])
@@ -1092,15 +1413,38 @@ def show_live_projects():
         "totalImages": summary.get("totalImages"), "latestImageDate": summary.get("latestImageDate"),
     }])
     row = audit_images(project, metadata, pd.DataFrame(columns=PHOTO_COLUMNS)).iloc[0]
+    try:
+        saved_row = saved_review_record(contract)
+    except (sqlite3.Error, ValueError):
+        saved_row = None
+    if saved_row and isinstance(saved_row[1].get("assessment"), dict) and saved_row[1].get("photos") is not None:
+        # One shared workspace for saved and live paths. Dates and amounts come from the live record; any
+        # difference from what the review saved is stated, not hidden.
+        reviewed_at, record = saved_row
+        notes = review_workspace.live_record_differences(record, detail, detail.get("completionDate"))
+        services = review_services(record, namespace="live", stale=review_is_stale(record), detail=detail)
+        show_review_workspace(record, reviewed_at, services, dates=contract_dates(detail), amounts=contract_amounts(detail),
+                              source_checked=checked_at, live_notes=notes)
+        with st.expander("Live source gallery with detector observations (not saved)"):
+            show_live_photos(contract, path, detail.get("components") or [],
+                             detail.get("category") or detail.get("infraType"), description=detail.get("description"))
+        return
     show_contract(contract, row)
-    with st.expander("Project dates, budget, and location"):
-        show_satellite_link(detail, key="live_satellite")
-        show_contract_timeline(detail)
-        show_budget(detail)
+    source_time, review_time = st.columns(2)
+    source_time.caption(f"Source record checked {language.format_timestamp(checked_at)}")
+    if saved:
+        review_time.caption(f"Saved review {language.format_timestamp(saved[1])} · {language.category_label(saved[0])}")
+    else:
+        review_time.caption("No saved review for this contract yet. Admin › Contract reviews can analyze it.")
+    show_saved_assessment(contract, detail)
     show_live_photos(
         contract, path, detail.get("components") or [], detail.get("category") or detail.get("infraType"),
         description=detail.get("description"),
     )
+    with st.expander("Timeline, budget and location"):
+        show_satellite_link(detail, key=f"live_satellite_{contract}")
+        show_contract_timeline(detail)
+        show_budget(detail)
 
 
 def review_model():
@@ -1250,7 +1594,7 @@ def show_regional_review_page(*, manage=False):
     status = columns[3].selectbox("Project status", [None, *API_STATUSES],
                                   format_func=lambda value: value or "All statuses", key="regional_status")
     if not region:
-        st.info("Select a region to start or resume a review.")
+        st.caption(":material/arrow_upward: Select a region to start or resume a review.")
         return
     search = st.text_input("Contract ID or description", key="regional_search").strip()
     show_regional_review({"region": region, "year": None if year == "All years" else year,
@@ -1266,7 +1610,16 @@ def show_saved_regional_dashboard():
                 THEN json_extract(q.filters, '$.region') IS NOT NULL ELSE 0 END
         """).fetchall()
     if not available:
-        st.info("Saved results appear here after a regional review in Admin.")
+        with closing(open_assessment_db()) as db:
+            queued = db.execute("SELECT COUNT(DISTINCT contract_id) FROM regional_queue WHERE done = 0").fetchone()[0]
+        empty_state("No saved regional reviews yet.",
+                    "Saved results appear here after a regional review is run in Admin. This page only shows saved "
+                    "reviews; it never starts one."
+                    + (f" {queued:,} contract{'' if queued == 1 else 's'} {'is' if queued == 1 else 'are'} queued "
+                       "and waiting to be reviewed; open Regional reviews in Admin to run or resume them." if queued else ""),
+                    action_label="Go to Admin · Regional reviews", key="regional_empty_to_admin",
+                    on_click=partial(go_to, "Admin", admin_section="Regional reviews"),
+                    icon=":material/map:")
         return
     filters_card = st.container(border=True)
     region_column, year_column = filters_card.columns(2)
@@ -1279,17 +1632,48 @@ def show_saved_regional_dashboard():
         if (region, None) in available:
             filters_card.caption("Includes saved reviews from runs without a fiscal year filter.")
     filters = {"region": region, "year": None if year == "All saved years" else year}
-    records = saved_regional_assessments(filters)
-    totals = saved_regional_totals(records)
-    metrics = st.columns(3)
-    metrics[0].metric(":material/fact_check: Reviewed contracts", f"{len(records):,}")
-    metrics[1].metric(":material/groups: Contractors", f"{len(contractor_performance(records)):,}")
-    metrics[2].metric(":orange[:material/warning:] Flagged contracts", f"{len(totals['flagged_contracts']):,}")
+    entries = saved_regional_entries(filters)
+    if not entries:
+        empty_state("No saved reviews match this region and year.",
+                    "Choose another year, or run the regional review in Admin to save reviews for this selection.",
+                    action_label="Go to Admin · Regional reviews", key="regional_none_to_admin",
+                    on_click=partial(go_to, "Admin", admin_section="Regional reviews"), icon=":material/map:")
+        return
     with closing(open_assessment_db()) as db:
         saved = db.execute("SELECT report FROM regional_highlights WHERE filters = ?",
                            (regional_filter_key(filters),)).fetchone()
     report = json.loads(saved[0]) if saved else None
-    render_regional_overview(totals, records, report, None, dashboard=True)
+    services = regional_view.Services(
+        show_details=show_regional_contract_details, open_contract=open_regional_contract,
+        contractor_comparison=show_contractor_performance, format_peso=format_peso,
+        generate_highlights=partial(generate_regional_highlights, filters),
+        go_admin=partial(go_to, "Admin", admin_section="Regional reviews"), model_name=review_model())
+    regional_view.render_regional_review(region, "All saved fiscal years" if year == "All saved years" else f"Fiscal year {year}",
+                                         filters, entries, saved_regional_queue(filters), report, services)
+
+
+def open_regional_contract(contract_id):
+    open_live_contract(contract_id)
+    go_to("Explore projects")
+
+
+def generate_regional_highlights(filters, records):
+    """Run the local model over saved records. Returns (report, error); a failure never touches recorded facts."""
+    try:
+        report = summarize_regional_evidence(records, review_model())
+    except (requests.RequestException, ValueError, OSError, sqlite3.Error, project_review.ReviewError):
+        return None, "The local model could not complete the highlights. Check that it is running, then try again."
+    report["generated_at"] = datetime.now(PHILIPPINE_TIME).isoformat()
+    if report["errors"] and not report["completed_batches"]:
+        return report, "The local model did not return any highlights. Check that it is running, then try again."
+    if report["completed_batches"] and not report["errors"]:
+        try:
+            with closing(open_assessment_db()) as db, db:
+                db.execute("INSERT OR REPLACE INTO regional_highlights VALUES (?, ?)",
+                           (regional_filter_key(filters), json.dumps(report, ensure_ascii=False)))
+        except sqlite3.Error:
+            return report, "The highlights were generated but could not be saved. They are shown for this visit only."
+    return report, None
 
 
 def regional_filter_key(filters):
@@ -1308,16 +1692,18 @@ def show_regional_review(params):
         else:
             st.caption("Fetches current regional records and checks photos if selected.")
         overview_key = (filters, use_saved, include_photos)
-        if st.button("Generate regional overview"):
+        if st.button("Generate regional overview", type="primary", key="generate_regional_overview"):
             st.session_state.pop("regional_review_v5", None)
             if use_saved:
                 try:
                     assessments = saved_regional_assessments(filters)
                 except (OSError, sqlite3.Error):
-                    st.warning("Saved reviews could not be loaded.")
+                    error_state("Saved reviews could not be loaded.", "The saved review database did not respond.",
+                                kept="No saved review was changed. Select Generate regional overview to retry.")
                     return
                 if not assessments:
-                    st.info("No saved queue entries match these filters. Run a regional review first.")
+                    empty_state("No saved queue entries match these filters.",
+                                "Run step 1 · Review project evidence first, or turn off Use saved reviews.")
                     return
                 st.session_state["regional_review_v5"] = (
                     overview_key, saved_regional_totals(assessments), assessments, None, None,
@@ -1328,12 +1714,12 @@ def show_regional_review(params):
         if not saved or saved[0] != overview_key:
             return
         _, totals, samples, report, error = saved
-        if st.button("Generate Ollama highlights"):
-            progress = st.progress(0, text="Summarizing contract evidence")
+        if st.button("Generate evidence highlights", key="generate_regional_highlights", help="Optional. A local model selects recorded facts worth highlighting; it does not write new findings."):
+            progress = st.progress(0, text="Generating evidence highlights · starting")
             try:
                 report = summarize_regional_evidence(
                     samples, review_model(),
-                    lambda done, total: progress.progress(done / total, text=f"Ollama · {done:,} of {total:,} batches summarized"),
+                    lambda done, total: progress.progress(done / total, text=f"Generating evidence highlights · {done:,} of {total:,} batches"),
                 )
                 error = None
             except (requests.RequestException, ValueError):
@@ -1350,9 +1736,30 @@ def show_regional_review(params):
 
 
 def saved_regional_assessments(filters):
+    return [entry["record"] for entry in saved_regional_entries(filters, check_stale=False)]
+
+
+def saved_regional_queue(filters):
+    """Distinct contracts in the saved review queues for this region and year: completed, and still queued."""
     with closing(open_assessment_db()) as db:
         rows = db.execute("""
-            SELECT DISTINCT a.summary
+            SELECT contract_id, done FROM regional_queue
+            WHERE CASE WHEN json_valid(filters) THEN
+                json_extract(filters, '$.region') = ?
+                AND (? IS NULL OR json_extract(filters, '$.year') = ?)
+            ELSE 0 END
+        """, (filters["region"], filters.get("year"), filters.get("year"))).fetchall()
+    completed = {contract for contract, done in rows if done}
+    pending = {contract for contract, done in rows if not done} - completed
+    return {"completed": len(completed), "pending": len(pending)} if rows else None
+
+
+def saved_regional_entries(filters, *, check_stale=True):
+    """Included saved reviews as {record, reviewed_at, stale}. Stale means saved with earlier rules or detectors."""
+    signature = current_model_signature() if check_stale else None
+    with closing(open_assessment_db()) as db:
+        rows = db.execute("""
+            SELECT DISTINCT a.summary, a.reviewed_at
             FROM regional_queue AS q
             JOIN contract_assessments AS a USING (contract_id)
             WHERE q.done = 1 AND CASE WHEN json_valid(q.filters) THEN
@@ -1361,15 +1768,16 @@ def saved_regional_assessments(filters):
             ELSE 0 END
         """, (filters["region"], filters.get("year"), filters.get("year"))).fetchall()
     search = (filters.get("search") or "").casefold()
-    assessments = []
-    for (payload,) in rows:
+    entries = []
+    for payload, reviewed_at in rows:
         record = json.loads(payload)
         if any(filters.get(field) and filters[field] != record.get(field) for field in ("category", "status")):
             continue
         if search and search not in record["contractId"].casefold() and search not in (record.get("description") or "").casefold():
             continue
-        assessments.append(record)
-    return assessments
+        entries.append({"record": record, "reviewed_at": reviewed_at,
+                        "stale": review_is_stale(record, signature) if check_stale else False})
+    return entries
 
 
 def saved_regional_totals(assessments):
@@ -1395,15 +1803,16 @@ def saved_regional_totals(assessments):
 
 def load_live_regional_overview(filters, include_photos, overview_key):
     try:
-        with st.spinner("Reading regional records"):
+        with loading("Fetching regional records"):
             totals, projects = regional_summary(filters)
     except (requests.RequestException, KeyError, ValueError):
-        st.warning("The regional records could not be loaded completely. Try again.")
+        error_state("The regional records could not be loaded completely.", "The source did not respond.",
+                    kept="Saved reviews are unchanged. Select Generate regional overview to retry.")
         return
     samples = []
     without_photos = set()
     if include_photos and projects:
-        progress = st.progress(0, text="Checking regional photo galleries")
+        progress = st.progress(0, text="Retrieving photos · checking regional galleries")
         samples, totals["photo_coverage"] = regional_photo_evidence(
             list(projects), lambda done, total: progress.progress(done / total, text=f"Photo review · {done:,} of {total:,} contracts checked"),
             without_photos=without_photos,
@@ -1427,25 +1836,27 @@ def render_regional_overview(totals, samples, report, error, *, dashboard=False)
     selected_project = None
     with st.container(border=True):
         st.subheader("Regional findings")
-        st.caption("Contract assessments by evidence category.")
+        st.caption("Saved photo evidence assessments by category. Manual decisions appear under their decision category.")
         with st.expander("Regional totals", expanded=not dashboard):
             for finding in regional_findings(totals):
                 st.text(finding)
         if counts := totals.get("contract_assessments"):
-            breakdown = pd.DataFrame(list(counts.items()), columns=["Evidence category", "Contracts"])
-            bars = alt.Chart(breakdown).encode(
-                x=alt.X("Contracts:Q", axis=alt.Axis(tickMinStep=1), scale=alt.Scale(
-                    domain=[0, max(counts.values()) * 1.18])),
-                y=alt.Y("Evidence category:N", sort="-x", axis=alt.Axis(title=None, labelLimit=0)),
-                tooltip=["Evidence category", "Contracts"],
-            )
-            fill = alt.Gradient(gradient="linear", x1=0, y1=0, x2=1, y2=0, stops=[
-                alt.GradientStop(color="#08766C", offset=0), alt.GradientStop(color="#2DD4BF", offset=1),
-            ])
-            chart = bars.mark_bar(color=fill, cornerRadiusEnd=5, size=18) + bars.mark_text(
-                align="left", dx=6, fontWeight=600,
-            ).encode(text="Contracts:Q")
-            st.altair_chart(chart.properties(height=alt.Step(30)), width="stretch")
+            # Native progress rows instead of a chart: text follows the theme in both modes, long labels wrap
+            # at any width, and each row states kind, category and count in words. Colour (icon) only
+            # supplements the kind word, using the same semantic slots as category badges.
+            breakdown = pd.DataFrame(
+                [(language.category_label(raw), language.KIND_STYLE[language.category_kind(raw)][0], count, raw)
+                 for raw, count in counts.items()],
+                columns=["Evidence category", "Kind", "Contracts", "Stored value"],
+            ).sort_values(["Contracts", "Evidence category"], ascending=[False, True])
+            largest = max(counts.values())
+            for label, raw, count in zip(breakdown["Evidence category"], breakdown["Stored value"], breakdown["Contracts"]):
+                word, icon, color = language.KIND_STYLE[language.category_kind(raw)]
+                st.progress(count / largest, text=f":{color}[{icon} {word}] · {escape_markdown(label)} · "
+                                                  f"**{count:,} contract{'' if count == 1 else 's'}**")
+            st.caption("Bar length is relative to the largest category. Counts are saved contract reviews, not verdicts.")
+            with st.expander("Table view of evidence categories"):
+                st.dataframe(breakdown[["Evidence category", "Kind", "Contracts", "Stored value"]], hide_index=True)
     if samples:
         with st.container(border=True):
             selected_project = show_contractor_performance(samples)
@@ -1454,7 +1865,8 @@ def render_regional_overview(totals, samples, report, error, *, dashboard=False)
     if flagged:
         with st.expander("Flagged contracts"):
             st.dataframe(
-                [{"Contract": contract, "Review flags": " · ".join(flags)} for contract, flags in flagged.items()],
+                [{"Contract": contract, "Review flags": " · ".join(
+                    language.flag_text(flag)[0] for flag in dict.fromkeys(flags))} for contract, flags in flagged.items()],
                 hide_index=True,
             )
     coverage = totals.get("photo_coverage")
@@ -1478,86 +1890,140 @@ def render_regional_overview(totals, samples, report, error, *, dashboard=False)
         st.subheader("Contract photo evidence")
         if selected_project:
             contract = selected_project["contractId"]
-            st.write(f"**{contract}**")
+            st.text(contract)
             if description := selected_project.get("description"):
-                st.write(description)
-            st.write(selected_project["assessment"]["completion_evidence_category"])
-            if timing := selected_project["assessment"].get("completion_photo_timing"):
-                st.caption(timing)
+                st.text(description)
+            assessment = selected_project.get("assessment") or {}
+            automatic, note = automatic_category(selected_project)
+            # Compact form: the full three-part overview is in the contract details above.
+            assessment_summary(selected_project, assessment, automatic, automatic_note=note)
             photos = selected_project.get("photos", [])
+            latest_day = language.latest_capture_day(photos)
             for start in range(0, len(photos), 3):
                 batch = photos[start:start + 3]
-                for number, (column, photo) in enumerate(zip(st.columns(len(batch)), batch), start=start + 1):
-                    column.image(photo["url"], caption=photo.get("capturedAt") or "Date unavailable")
-                    column.link_button(f"Open photo {number}", photo["url"])
+                for index, (column, photo) in enumerate(zip(st.columns(3), batch), start=start):
+                    caption = language.photo_caption(photos, index, latest_day)
+                    with column:
+                        photo_with_fallback(photo.get("url"), f"Project photo {index + 1}", caption)
+                        if photo.get("url"):
+                            st.link_button(f"Open photo {index + 1}", photo["url"])
             if not photos:
-                st.caption("This contract has no saved gallery photos.")
+                show_state("no_photos" if selected_project.get("galleryPhotoCount") == 0 else "retrieval_failed",
+                           "No photos were saved with this review.")
         elif samples:
             st.caption("Select a project row in the contractor table to see its photo evidence.")
     if error:
-        st.warning(error)
+        error_state("Evidence highlights are unavailable.", escape_markdown(error),
+                    kept="Recorded facts are still shown.")
     if isinstance(report, str):
-        st.subheader("Ollama evidence summary")
-        st.text(report)
+        st.subheader("Evidence highlights")
+        st.text(language.relabel_text(report))
     elif report:
-        st.subheader("Ollama evidence summary")
+        st.subheader("Evidence highlights")
+        st.caption("Selected from recorded facts; the text below is the saved fact, not generated wording.")
         st.caption(f"{report['completed_batches']:,} of {report['total_batches']:,} batches summarized.")
-        for failure in report["errors"]:
-            st.warning(failure)
+        if report["errors"]:
+            error_state(f"{len(report['errors']):,} highlight batch{'' if len(report['errors']) == 1 else 'es'} failed.",
+                        "  \n".join(escape_markdown(str(failure)) for failure in report["errors"]),
+                        kept="Highlights from completed batches and all recorded facts are still shown.")
         if report["summary"]:
-            st.text(report["summary"])
+            st.text(language.relabel_text(report["summary"]))
         for summary in report["batch_summaries"]:
-            st.text(summary)
+            st.text(language.relabel_text(summary))
 
 
 def show_contractor_performance(contracts):
     groups = contractor_performance(contracts)
     if not groups:
         return
-    st.subheader("Contractor performance")
-    st.html("".join(f'<span class="bant-chip">{label} {points:+d}</span>'
+    st.subheader("Contractor schedule scores · saved reviews")
+    st.caption("A rules-based comparison of reported dates and saved photo assessments for the included contracts. "
+               "It is not a comprehensive quality assessment of any contractor.")
+    scored_total = sum(row["Points"] is not None for group in groups for row in group["contracts"])
+    included_total = sum(len(group["contracts"]) for group in groups)
+    by_id = {record["contractId"]: record for record in contracts}
+    unreported = [g for g in groups if all(not (by_id[r["Contract"]].get("contractor") or "").strip()
+                                          for r in g["contracts"])]
+    named = len(groups) - len(unreported)
+    unreported_contracts = sum(len(g["contracts"]) for g in unreported)
+    st.markdown(f"**{named:,} contractor{'' if named == 1 else 's'} compared · {included_total:,} included "
+                f"contract{'' if included_total == 1 else 's'} · {scored_total:,} scored · "
+                f"{included_total - scored_total:,} with No score**")
+    if unreported_contracts:
+        st.caption(f"{unreported_contracts:,} included contract{' has' if unreported_contracts == 1 else 's have'} no reported "
+                   f"contractor and {'appears' if unreported_contracts == 1 else 'appear'} in one “Unreported contractor” row. That row is a holding group, not a contractor.")
+    st.caption("No score means the contract has no qualifying photo evidence or reported dates to score. It is not zero "
+               "and it is left out of every total and average below.")
+    st.caption("Formula · Ranking score = total points ÷ √(number of scored contracts). Every contractor is compared on "
+               "this same basis; Points per scored contract is the plain average. Scoring rules are unchanged.")
+    st.caption(f"Limits · Contractors with fewer than {regional_view.SMALL_SCORED} scored contracts are marked Small sample "
+               "because one contract can move their rank. The score uses reported dates and saved photo assessments only; "
+               "it says nothing about quality or conduct. " + language.TIMING_NOTE)
+    st.html("".join(f'<span class="bant-chip">{language.score_level_label(label)} {points:+d}</span>'
                     for label, points in CONTRACT_SCORE_LEVELS.items() if points is not None))
     with st.expander("How scoring works"):
-        st.caption("Points use reported completion versus listed contract expiry. Incomplete contracts within "
-                   f"their deadline are pending. An assessment flag for possible unfinished work deducts {UNFINISHED_WORK_PENALTY} points.")
+        st.caption("Schedule points compare the reported completion date with the listed contract expiry. Incomplete "
+                   f"contracts before expiry are pending. An assessment flag for possible unfinished work deducts {UNFINISHED_WORK_PENALTY} points.")
         st.caption("Ranking score is total points divided by the square root of the number of scored contracts. "
                    "For example, an average of 2 points across 4 scored contracts gives a ranking score of 4.")
-        st.caption("Contracts need qualifying photo evidence of completion or possible unfinished work to receive points.")
-        st.caption("Latest reviewed photo timing uses the reported completion date. Captured 8–31 days later "
-                   "deducts one point. Captured more than 31 days later deducts two points.")
+        st.caption("Only contracts with a qualifying photo assessment (visible scope evidence or possible unfinished work) "
+                   "receive points. A blank score means No score; it is never counted as zero.")
+        st.caption("Scoring convention: if the latest reviewed photo was captured 8–31 days after reported completion, one point "
+                   "is deducted; more than 31 days, two points. " + language.TIMING_NOTE)
     totals = []
     for group in groups:
         points = [row["Points"] for row in group["contracts"] if row["Points"] is not None]
         totals.append({
-            "Contractor": group["name"], "Contracts": len(group["contracts"]), "Scored": len(points),
+            "Contractor": group["name"], "Included contracts": len(group["contracts"]), "Scored": len(points),
             "Total points": sum(points) if points else None,
             "Ranking score": sum(points) / sqrt(len(points)) if points else None,
             "Points per scored contract": round(sum(points) / len(points), 2) if points else None,
+            "No score": len(group["contracts"]) - len(points),
+            "Sample": ("No score" if not points else "Small sample" if len(points) < regional_view.SMALL_SCORED else "Scored"),
             "Large ABC–award gaps": sum(row["Difference (%)"] is not None for row in group["contracts"]),
+            "Budget gap not checkable": sum(not regional_view.budget_gap_checkable(by_id[row["Contract"]])
+                                            for row in group["contracts"]),
         })
-    ranking = pd.DataFrame(totals).sort_values(["Ranking score", "Total points", "Contractor"], ascending=[False, False, True])
-    light = getattr(st.context, "theme", {}).get("type") == "light"
-
-    def point_style(value):
-        if pd.isna(value) or value == 0:
-            return ""
-        if value > 0:
-            return "color:#166534;background-color:#DEF5E7" if light else "color:#4ADE80;background-color:#163328"
-        return "color:#9F1239;background-color:#FFE4E9" if light else "color:#FDA4AF;background-color:#3B2432"
-
-    styled_ranking = ranking.style.map(point_style, subset=["Ranking score", "Total points", "Points per scored contract"]).map(
-        lambda value: status_cell_style("On-Going") if value > 0 else "", subset=["Large ABC–award gaps"],
-    )
-    st.dataframe(styled_ranking, hide_index=True, column_config={
+    # Sort on the numbers (missing last), then show text: "No score" is never zero and no tint implies a verdict.
+    ranking = pd.DataFrame(totals).sort_values(["Ranking score", "Total points", "Contractor"],
+                                               ascending=[False, False, True], na_position="last")
+    shown = ranking.assign(**{
+        "Total points": ranking["Total points"].map(lambda v: language.score_text(v, signed=True)),
+        "Ranking score": ranking["Ranking score"].map(lambda v: language.score_text(v, decimals=2)),
+        "Points per scored contract": ranking["Points per scored contract"].map(lambda v: language.score_text(v, signed=True, decimals=2)),
+    })
+    st.dataframe(shown.style.map(lambda value: "font-weight:700" if value > 0 else "", subset=["Large ABC–award gaps"]),
+                 hide_index=True, column_config={
         "Contractor": st.column_config.TextColumn("Contractor", width=260),
-        "Ranking score": st.column_config.NumberColumn(format="%.2f"),
-        "Points per scored contract": st.column_config.NumberColumn(format="%.2f"),
+        "Total points": st.column_config.TextColumn("Total points", help="Sum of points for scored contracts. No score is not zero."),
+        "Ranking score": st.column_config.TextColumn("Ranking score", help="Total points ÷ √(scored contracts)."),
+        "Points per scored contract": st.column_config.TextColumn("Points per scored contract"),
+        "Scored": st.column_config.NumberColumn("Scored", help="Contracts with points. The ranking score uses only these."),
+        "No score": st.column_config.NumberColumn("No score", help="Included contracts without a score. Not counted as zero."),
+        "Sample": st.column_config.TextColumn("Sample", help=f"Small sample = fewer than {regional_view.SMALL_SCORED} scored contracts."),
+        "Large ABC–award gaps": st.column_config.NumberColumn(
+            "Large ABC–award gaps", help=f"Contracts whose award differs from the approved budget by at least {BUDGET_FLAG_PERCENT}%."),
+        "Budget gap not checkable": st.column_config.NumberColumn(
+            "Budget gap not checkable", help="Contracts missing the approved budget or award amount. Unknown amounts are not read as zero."),
     })
     with st.container(border=True):
         selected = st.selectbox("Show contracts for", ranking.index.tolist(), format_func=lambda i: groups[i]["name"])
     rows = groups[selected]["contracts"]
     frame = pd.DataFrame(rows)
-    st.caption("Photo days from reported completion shows a positive number for later photos and a negative number for earlier photos.")
+    # Display-only relabelling; scoring already ran on the raw values.
+    frame["Level"] = frame["Level"].map(language.score_level_label)
+    frame["Photo assessment"] = frame["Photo assessment"].map(lambda raw: language.category_label(raw) if raw else "No saved assessment")
+    for column in ("Points", "Schedule points", "Photo timing points"):
+        frame[column] = frame[column].map(lambda v: language.score_text(v, signed=True))
+    for column in ("Reported completion", "Contract expiry", "Latest photo date"):
+        frame[column] = frame[column].map(lambda v: language.format_timestamp(None if v is None or v != v else str(v)))
+    for column in ("Days from expiry", "Photo days from reported completion"):
+        frame[column] = frame[column].map(lambda v: "Date unknown" if v is None or v != v else f"{int(v):+d}")
+    frame["Status"] = frame["Status"].fillna("Unavailable")
+    frame = frame.rename(columns={"Status": "Reported status",
+                                  "Photo days from reported completion": "Photo timing (days from reported completion)"})
+    st.caption("Photo timing: days from reported completion to the latest reviewed photo, positive after and negative before. "
+               + language.TIMING_NOTE)
     st.caption("Select a project row to see its saved details.")
     budget_columns = ["ABC (PHP)", "Award (PHP)", "Award minus ABC (PHP)", "Difference (%)"]
     contract_ids = tuple(frame["Contract"])
@@ -1591,126 +2057,132 @@ def show_regional_contract_details(record):
     assessment = record.get("assessment") or {}
     st.subheader(contract_id)
     if description := record.get("description"):
-        st.write(description)
-    st.write(f"Contractor · {record.get('contractor') or 'Unavailable'}")
-    st.write(f"Reported status · {record.get('status') or 'Unavailable'}")
-    if category := assessment.get("completion_evidence_category"):
-        st.markdown("**Photo assessment**")
-        st.write(category)
-        if outcome := assessment.get("completion_assessment"):
-            st.write(outcome)
-    if timing := assessment.get("completion_photo_timing"):
-        st.caption(timing)
-    for flag in assessment.get("flags", []):
-        st.warning(flag)
+        st.text(description)
+    st.text(f"Contractor · {record.get('contractor') or 'Unavailable'}")
+    if assessment.get("completion_evidence_category") is not None:
+        automatic, note = automatic_category(record)
+        evidence_overview(record, assessment, automatic, automatic_note=note)
+    else:
+        st.text(f"Reported status · {record.get('status') or 'Unavailable'}")
+    show_flags(assessment.get("flags", []))
     dates, budgets = st.columns(2)
     for label, value in (record.get("dates") or {}).items():
         if value:
-            dates.write(f"{label} · {value}")
+            dates.text(f"{label} · {language.format_timestamp(value)}")
     for label, value in (record.get("budgetPHP") or {}).items():
-        if value is not None:
-            budgets.write(f"{label} · {format_peso(value)}")
+        # Unknown is not zero: every source amount is listed, unavailable ones included.
+        budgets.text(f"{label} · {format_peso(value)}")
     st.link_button("Open DPWH contract", project_url(contract_id))
-    for index, photo in enumerate(record.get("photos", []), start=1):
+    photos = record.get("photos", [])
+    latest_day = language.latest_capture_day(photos)
+    for index, photo in enumerate(photos):
         if url := photo.get("url"):
-            st.link_button(f"Photo {index} · {photo.get('capturedAt') or 'Date unavailable'}", url)
+            st.link_button(language.photo_caption(photos, index, latest_day), url)
 
 
-@st.cache_resource
-def regional_run_registry():
-    return {}, Lock()
+def queue_deps():
+    """Everything the background worker needs from this app, resolved at call time."""
+    return queue_worker.Deps(
+        open_db=open_assessment_db,
+        fetch_projects=lambda filters: regional_summary(filters)[1],
+        fetch_inputs=lambda contract: fetch_contract_review_inputs(contract),
+        summarize=lambda contract, inputs: summarize_contract(contract, cache_counts=Counter(), save=False, inputs=inputs),
+        refresh_staged=refresh_staged_record,
+        save=lambda record: save_contract_assessments([record], require_saved=True),
+        is_due=lambda record, reviewed_at, signature: review_due(record, reviewed_at, signature),
+        is_stale=lambda record, signature: review_is_stale(record, signature),
+        signature=current_model_signature,
+    )
 
 
-@st.fragment(run_every=3)
+def refresh_staged_record(record):
+    record["assessment"] = assess_with_manual_review(record)
+    return record
+
+
+def open_regional_results(filters):
+    """Open this scope's saved results in Regional review (only offered when saved results exist)."""
+    region = filters["region"]
+    year = str(filters["year"]) if filters.get("year") else "All saved years"
+    try:
+        with closing(open_assessment_db()) as db:
+            saved = {(r, str(y) if y is not None else None) for r, y in db.execute("""
+                SELECT DISTINCT json_extract(q.filters, '$.region'), json_extract(q.filters, '$.year')
+                FROM regional_queue AS q JOIN contract_assessments USING (contract_id)
+                WHERE q.done = 1 AND CASE WHEN json_valid(q.filters) THEN 1 ELSE 0 END""")}
+    except (OSError, sqlite3.Error):
+        saved = set()
+    # Preselect only a region and year the reader page actually lists; otherwise just open it.
+    if any(r == region for r, _ in saved):
+        st.session_state["dashboard_region"] = region
+        if year == "All saved years" or (region, year) in saved:
+            st.session_state[f"dashboard_year_{region}"] = year
+    go_to("Regional review")
+
+
 def show_regional_queue(filters):
-    key = regional_filter_key(filters)
-    st.caption("Saves each contract’s rules-based assessment and YOLO findings. Ollama is available separately for the regional overview.")
-    runs, lock = regional_run_registry()
-    with closing(open_assessment_db()) as db:
-        total, done = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(done), 0) FROM regional_queue WHERE filters = ?", (key,),
-        ).fetchone()
-    if total:
-        st.progress(done / total, text=f"{done:,} of {total:,} contracts saved")
-    with lock:
-        job = runs.get(key)
-        if job and job["thread"].is_alive():
-            stopping = job["stop"].is_set()
-            st.caption("Pausing after the current contract…" if stopping else "Regional review is running.")
-            if st.button("Pause regional review", disabled=stopping):
-                job["stop"].set()
-                st.info("Pause requested. The current contract will finish saving.")
-            return
-        if job and job.get("error"):
-            st.warning(f"Regional review paused. {job['error']}")
-        elif job and job["stop"].is_set() and done < total:
-            st.info("Regional review paused. Saved progress is ready to resume.")
-        elif job and not total:
-            st.info("No contracts match these filters.")
-        action = "Start regional review" if not total else "Resume regional review" if done < total else "Check new and due contracts"
-        if st.button(action, key="run_regional_queue", type="primary"):
-            job = {"stop": Event()}
-            job["thread"] = Thread(target=run_regional_queue, args=(filters, key, total, done, job), daemon=True)
-            runs[key] = job
-            job["thread"].start()
+    st.caption("Saves each contract’s rules-based assessment and YOLO findings. Evidence highlights are a separate stage: "
+               "generate them in step 2 once reviews are saved; they never start a check.")
+    scope = [("Region", filters["region"]), ("Fiscal year", filters.get("year") or "All years"),
+             ("Category", filters.get("category") or "All categories"), ("Status", filters.get("status") or "All statuses")]
+    if filters.get("search"):
+        scope.append(("Search", filters["search"]))
+    panel = queue_view.Panel(key=regional_filter_key(filters), noun="regional review", scope=scope, deps=queue_deps,
+                             filters=filters, open_results=partial(open_regional_results, filters),
+                             widget_prefix="regional_queue")
+    show_queue_panel(panel)
 
 
 @st.fragment(run_every=3)
+def show_queue_panel(panel):
+    try:
+        queue_view.render_queue(panel)
+    except (OSError, sqlite3.Error):
+        error_state("The saved review queue is unavailable.", "The saved review database did not respond.",
+                    kept="Saved reviews and queue progress are unchanged. This section checks again every few seconds.")
+
+
 def show_category_reruns():
     st.caption("Recheck a saved category with the current YOLO checkpoints. Manual category decisions are preserved.")
-    runs, lock = regional_run_registry()
     try:
         with closing(open_assessment_db()) as db:
             categories = dict(db.execute("SELECT category, COUNT(*) FROM contract_assessments GROUP BY category ORDER BY category"))
             for (key,) in db.execute("SELECT DISTINCT filters FROM regional_queue WHERE filters LIKE 'category-rerun:%'"):
                 categories.setdefault(key.removeprefix("category-rerun:"), 0)
-            previous = st.session_state.get("rerun_selected_category")
-            options = sorted(categories)
-            category = st.selectbox(
-                "Saved review category", options, index=options.index(previous) if previous in options else None,
-                key="rerun_category", on_change=remember_rerun_category,
-            )
-            if category is None:
-                return
-            st.caption(f"{categories[category]:,} contracts currently in this category")
-            key = f"category-rerun:{category}"
-            total, done = db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(done), 0) FROM regional_queue WHERE filters = ?", (key,),
-            ).fetchone()
-            if total:
-                st.progress(done / total, text=f"{done:,} of {total:,} contracts rechecked")
-                if done == total:
-                    st.success("Rerun complete. Results are saved under Reviewed contracts.")
-            with lock:
-                job = runs.get(key)
-                if job and job["thread"].is_alive():
-                    stopping = job["stop"].is_set()
-                    if st.button("Pause rerun", disabled=stopping):
-                        job["stop"].set()
-                    if job["stop"].is_set():
-                        st.caption("Pausing after the current contract.")
-                    return
-                if job and job.get("error"):
-                    st.warning(f"Rerun paused. {job['error']}")
-                resume = done < total
-                if not st.button("Resume rerun" if resume else "Rerun category", type="primary",
-                                 disabled=not resume and not categories[category]):
-                    return
-                if not resume:
-                    with db:
-                        db.execute("BEGIN IMMEDIATE")
-                        db.execute("DELETE FROM regional_queue WHERE filters = ?", (key,))
-                        db.execute("""
-                            INSERT INTO regional_queue(filters, position, contract_id)
-                            SELECT ?, ROW_NUMBER() OVER (ORDER BY contract_id) - 1, contract_id
-                            FROM contract_assessments WHERE category = ?
-                        """, (key, category))
-                job = {"stop": Event()}
-                job["thread"] = Thread(target=run_regional_queue, args=(None, key, 0, 0, job), daemon=True)
-                runs[key] = job
-                job["thread"].start()
     except (OSError, sqlite3.Error):
-        st.warning("The saved review queue is unavailable.")
+        error_state("The saved review queue is unavailable.", "The saved review database did not respond.",
+                    kept="Saved reviews and queue progress are unchanged. Reload the page to check again.")
+        return
+    previous = st.session_state.get("rerun_selected_category")
+    options = sorted(categories)
+    category = st.selectbox(
+        "Saved review category", options, index=options.index(previous) if previous in options else None,
+        key="rerun_category", on_change=remember_rerun_category, format_func=language.category_label,
+    )
+    if category is None:
+        return
+    key = f"category-rerun:{category}"
+    panel = queue_view.Panel(
+        key=key, noun="category rerun", scope=[("Saved category", language.category_label(category)),
+                                              ("Contracts now in this category", f"{categories[category]:,}")],
+        deps=queue_deps, prepare=partial(seed_category_rerun, key, category),
+        open_results=partial(go_to, "Admin", admin_section="Reviewed contracts"),
+        start_label="Rerun category", resume_label="Resume rerun", check_label="Rerun category", widget_prefix="category_rerun",
+        disabled_reason=None if categories[category] else "No saved contracts are in this category, so there is nothing to rerun.")
+    show_queue_panel(panel)
+
+
+def seed_category_rerun(key, category):
+    """Start a new rerun: a fresh queue of the contracts now in the category. Earlier reviews stay until replaced."""
+    with closing(open_assessment_db()) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM regional_queue WHERE filters = ?", (key,))
+        db.execute("DELETE FROM queue_failures WHERE filters = ?", (key,))
+        db.execute("""
+            INSERT INTO regional_queue(filters, position, contract_id)
+            SELECT ?, ROW_NUMBER() OVER (ORDER BY contract_id) - 1, contract_id
+            FROM contract_assessments WHERE category = ?
+        """, (key, category))
 
 
 def remember_rerun_category():
@@ -1718,60 +2190,11 @@ def remember_rerun_category():
 
 
 def run_regional_queue(filters, key, total, done, job):
-    stop = job["stop"]
-    try:
-        if filters is not None and (not total or done == total):
-            _, projects = regional_summary(filters)
-            with closing(open_assessment_db()) as db, db:
-                db.execute("BEGIN IMMEDIATE")
-                existing = set(db.execute("SELECT contract_id FROM regional_queue WHERE filters = ?", (key,)).fetchall())
-                total = len(existing)
-                new_ids = [contract for contract in projects if (contract,) not in existing]
-                db.executemany(
-                    "INSERT INTO regional_queue(filters, position, contract_id) VALUES (?, ?, ?)",
-                    ((key, position, contract) for position, contract in enumerate(new_ids, start=total)),
-                )
-                total += len(new_ids)
-                for contract, reviewed, payload in db.execute("SELECT contract_id,reviewed_at,summary FROM contract_assessments").fetchall():
-                    if contract in projects and review_due(json.loads(payload), reviewed):
-                        db.execute("UPDATE regional_queue SET done = 0, staged = NULL WHERE filters = ? AND contract_id = ?", (key, contract))
-        if filters is not None and not total:
-            return
-        with ThreadPoolExecutor(max_workers=4) as workers:
-            while True:
-                with closing(open_assessment_db()) as db:
-                    batch = db.execute(
-                        "SELECT position, contract_id, staged FROM regional_queue "
-                        "WHERE filters = ? AND done = 0 ORDER BY position LIMIT 4", (key,),
-                    ).fetchall()
-                if not batch:
-                    return
-                batch = [(position, contract, None if staged and review_is_stale(json.loads(staged)) else staged)
-                         for position, contract, staged in batch]
-                pending = {
-                    position: workers.submit(fetch_contract_review_inputs, contract)
-                    for position, contract, staged in batch if staged is None
-                }
-                for position, contract, staged in batch:
-                    if stop.is_set():
-                        for future in pending.values():
-                            future.cancel()
-                        return
-                    if staged is None:
-                        inputs = pending[position].result()
-                        if inputs[1]["galleryPhotoCount"] is None:
-                            raise ValueError(f"The gallery for {contract} is unavailable.")
-                        record = summarize_contract(contract, cache_counts=Counter(), save=False,
-                                                    inputs=inputs)
-                    else:
-                        record = json.loads(staged)
-                        record["assessment"] = assess_with_manual_review(record)
-                    save_contract_assessments([record], require_saved=True)
-                    with closing(open_assessment_db()) as db, db:
-                        db.execute("UPDATE regional_queue SET done = 1, staged = NULL WHERE filters = ? AND position = ?",
-                                   (key, position))
-    except Exception as error:
-        job["error"] = str(error)
+    """Run a queue to the end of its work in this thread (the dashboard starts the same worker in a background thread)."""
+    worker = queue_worker.Job(key, stop=job["stop"])
+    queue_worker.run(worker, queue_deps(), filters, fetch=filters is not None and (not total or done == total))
+    if worker.error:
+        job["error"] = worker.error
 
 
 def show_ai_reviews(contract_ids, selected_contract):
@@ -1784,10 +2207,10 @@ def show_ai_reviews(contract_ids, selected_contract):
         )
         targets = chosen or ([selected_contract] if selected_contract else [])
         st.caption("Contract decisions and budget observations use deterministic evidence rules. Ollama selects regional highlights separately.")
-        if st.button("Analyze contract evidence", type="primary", disabled=not targets):
+        if st.button("Analyze contract evidence", type="primary", disabled=not targets, key="analyze_contract_evidence"):
             results = {}
             for contract_id in targets:
-                with st.spinner(f"Reviewing {contract_id} evidence…"):
+                with loading(f"Analyzing evidence for {contract_id} · fetching records, retrieving photos, checking detectors"):
                     try:
                         summary = summarize_contract(contract_id)
                     except (requests.RequestException, KeyError, ValueError):
@@ -1797,6 +2220,7 @@ def show_ai_reviews(contract_ids, selected_contract):
                         report = review_project(summary, model)
                         results[contract_id] = (
                             report, summary["photos"], summary["dates"]["Reported completion"], summary["assessment"],
+                            summary.get("status"),
                         )
                     except ReviewError as error:
                         results[contract_id] = str(error)
@@ -1813,34 +2237,33 @@ def show_ai_reviews(contract_ids, selected_contract):
             st.subheader(contract_id)
             result = results[contract_id]
             if isinstance(result, str):
-                st.warning(result)
+                error_state("Analysis unavailable for this contract.", escape_markdown(result),
+                            kept="Any previously saved review is unchanged. Select Analyze contract evidence to retry.")
                 continue
             if result is None:
-                st.warning("Review unavailable. Check the API connections and try again.")
+                error_state("Review unavailable.", "Check the API connections and try again.",
+                            kept="Any previously saved review is unchanged.")
                 continue
             report, photos, *dates = result
             completion = pd.to_datetime(dates[0] if dates else None, errors="coerce")
             assessment = dates[1] if len(dates) > 1 else None
-            st.markdown(f"**{assessment.get('completion_evidence_category', assessment['reported_status_summary']) if assessment else report['conclusion']}**")
             if assessment:
-                st.text(assessment["completion_assessment"])
-                if timing := assessment.get("completion_photo_timing"):
-                    st.caption(timing)
+                status = dates[2] if len(dates) > 2 else assessment.get("reported_status_summary")
+                summary = {"status": status, "dates": {"Reported completion": dates[0] if dates else None},
+                           "photos": photos, "budgetPHP": {}, "assessment": assessment}
+                automatic, note = automatic_category(summary)
+                evidence_overview(summary, assessment, automatic, automatic_note=note)
                 if reason := assessment.get("completion_evidence_reason"):
                     st.caption(reason)
-                for flag in assessment["flags"]:
-                    st.warning(flag)
-            st.text(report["summary"])
+                show_flags(assessment["flags"])
+            else:
+                st.markdown(f"**{escape_markdown(report['conclusion'])}**")
+            st.text(language.relabel_text(report["summary"]))
             st.caption(f"Photo sample reviewed · {len(photos)}")
             if assessment and (number := assessment.get("latest_evidence_photo")):
                 photo = photos[number - 1]
-                st.link_button(f"Latest photo · {photo['capturedAt']}", photo["url"])
-                offset = assessment.get("latest_photo_days_from_reported_completion")
-                if offset == 0:
-                    st.caption("Captured on the reported completion date.")
-                elif offset is not None:
-                    direction = "after" if offset > 0 else "before"
-                    st.caption(f"Captured {abs(offset)} day(s) {direction} reported completion.")
+                st.link_button(f"Latest photo {number} · {language.format_timestamp(photo.get('capturedAt'))}", photo["url"])
+                st.caption(language.photo_timing_text(assessment.get("latest_photo_days_from_reported_completion")))
             for finding in report["photo_findings"]:
                 number = finding["photo"]
                 if 1 <= number <= len(photos):
@@ -1852,10 +2275,9 @@ def show_ai_reviews(contract_ids, selected_contract):
                         st.caption(f"Building work stage · {building_stage}")
                     captured = pd.to_datetime(photos[number - 1].get("capturedAt"), errors="coerce")
                     if building_stage == "Visible unfinished work" and photo_on_or_after_completion(captured, completion):
-                        st.warning(
-                            f"Review possible unfinished work. Photo dated {captured.date()}; "
-                            f"reported completion {completion.date()}."
-                        )
+                        notice("Review possible unfinished work.",
+                               f"Photo dated {captured.date()}; reported completion {completion.date()}. "
+                               "Photo timing is not a measured delay.", icon=":material/visibility:")
                     st.text(finding["observation"])
                     st.link_button(f"Open cited photo {number}", photos[number - 1]["url"])
             st.text(f"Budget review · {report['budget_observation']}")
@@ -2023,10 +2445,10 @@ def show_contract_comparison(contract_ids, selected_contract, model):
             placeholder="Choose up to 3 contracts from this results page",
         )
         targets = tuple(selected or ([selected_contract] if selected_contract else []))
-        if st.button("Build contract summaries", disabled=not targets):
+        if st.button("Build contract summaries", type="primary", disabled=not targets, key="build_contract_summaries"):
             summaries, failures = [], []
             for contract_id in targets:
-                with st.spinner(f"Summarizing {contract_id}"):
+                with loading(f"Fetching records and retrieving photos for {contract_id}"):
                     try:
                         summaries.append(summarize_contract(contract_id))
                     except (requests.RequestException, KeyError, ValueError):
@@ -2038,12 +2460,12 @@ def show_contract_comparison(contract_ids, selected_contract, model):
             return
         _, summaries, failures = saved
         for contract_id in failures:
-            st.warning(f"Contract details unavailable for {contract_id}.")
+            error_state(f"Contract details unavailable for {contract_id}.", "The source did not respond.",
+                        kept="Other summaries are shown. Select Build contract summaries to retry.")
         for summary in summaries:
             st.subheader(summary["contractId"])
             st.text(summary["description"] or "Description unavailable")
             st.text(f"Contractor · {summary['contractor'] or 'Unavailable'}")
-            st.text(f"Reported status · {summary['status'] or 'Unavailable'}")
             for label, value in summary["dates"].items():
                 st.text(f"{label} · {format_date(pd.to_datetime(value, errors='coerce'))}")
             for label, value in summary["budgetPHP"].items():
@@ -2051,42 +2473,47 @@ def show_contract_comparison(contract_ids, selected_contract, model):
             total = summary["galleryPhotoCount"]
             st.caption(summary["photoCoverage"])
             assessment = summary.get("assessment") or assess_contract(summary)
-            st.text(assessment.get("completion_evidence_category") or assess_contract(summary)["completion_evidence_category"])
-            st.text(assessment["completion_assessment"])
-            if timing := assessment.get("completion_photo_timing"):
-                st.caption(timing)
+            if not assessment.get("completion_evidence_category"):
+                assessment = {**assessment, "completion_evidence_category": assess_contract(summary)["completion_evidence_category"]}
+            automatic, automatic_note = automatic_category({**summary, "assessment": assessment})
+            evidence_overview(summary, assessment, automatic, automatic_note=automatic_note)
+            st.text(f"Review outcome · {language.outcome_label(assessment['completion_assessment'])}")
             if reason := assessment.get("completion_evidence_reason"):
                 st.caption(reason)
-            for flag in assessment["flags"]:
-                st.warning(flag)
+            show_flags(assessment["flags"])
             with st.expander(f"{summary['contractId']} assessment details"):
                 st.json(assessment)
             st.caption(f"Photos reviewed · {len(summary['photos'])} of {total if total is not None else 'unknown'}")
-            for number, photo in enumerate(summary["photos"], start=1):
-                label = "Latest photo" if number == assessment.get("latest_evidence_photo") else f"Photo {number}"
-                st.link_button(f"{label} · {photo['capturedAt'] or 'Date unavailable'}", photo["url"])
+            latest_day = language.latest_capture_day(summary["photos"])
+            for index, photo in enumerate(summary["photos"]):
+                st.link_button(language.photo_caption(summary["photos"], index, latest_day), photo["url"])
                 if photo["scope"]:
                     st.text(photo["scope"])
                 for observation in photo["yolo"]:
-                    st.text(f"{observation['detector']} · {observation['observation']}")
+                    label, use = language.eligibility(observation.get("quality"))
+                    st.text(f"{language.finding_text(observation)} · {label}", help=use)
+                if any(o.get("status") == "detected" for o in photo["yolo"]):
+                    st.caption(language.MODEL_SCORE_NOTE)
                 if not photo["yolo"]:
                     st.caption("No detector configured for this photo category.")
-        if st.button("Compare summaries", disabled=len(summaries) < 2 or bool(failures)):
+        if st.button("Compare summaries", disabled=len(summaries) < 2 or bool(failures), key="compare_summaries"):
             st.session_state.pop("contract_comparison_v4", None)
             try:
-                with st.spinner("Comparing contract evidence"):
+                with loading("Comparing contract evidence"):
                     st.session_state["contract_comparison_v4"] = (targets, compare_contracts(summaries, model))
             except ReviewError as error:
-                st.warning(str(error))
+                error_state("Contract comparison unavailable.", escape_markdown(str(error)),
+                            kept="The summaries above are unchanged.")
             except (requests.RequestException, ValueError):
-                st.warning("Contract comparison unavailable. Check the source records and retry.")
+                error_state("Contract comparison unavailable.", "Check the source records and retry.",
+                            kept="The summaries above are unchanged.")
         comparison = st.session_state.get("contract_comparison_v4")
         if comparison and comparison[0] == targets:
             report = comparison[1]
             st.subheader("Combined conclusion")
             st.text(report["conclusion"])
             for finding in report["findings"]:
-                st.text(finding)
+                st.text(language.relabel_text(finding))
             for gap in report["evidence_gaps"]:
                 st.text(f"Evidence gap · {gap}")
 
@@ -2211,18 +2638,21 @@ def show_photo_analysis(column, url, detector, supported, available, models):
     weights = models.get(detector)
     if weights:
         target = YOLO_MODELS[detector][2]
-        with column, st.spinner("Checking photo"):
+        with column, loading("Analyzing photo"):
             description, overlay = analyze_project_photo(url, *weights)
         if description.startswith("YOLO detected "):
-            column.write(plain_photo_finding(description, target))
+            column.text(plain_photo_finding(description, target))
+            label, use = language.eligibility(model_quality(detector, Path(weights[1])))
+            column.caption(f"{detector} · {label}. {use}")
         if overlay:
             with column.expander(f"View overlay for {target.removeprefix('visible ')}"):
-                st.image(overlay)
+                st.image(overlay, caption="Detector observation overlay; not a verification mark.")
         return description
     elif detector not in supported:
-        column.caption("YOLO analysis is unavailable for this infrastructure category.")
+        column.caption("No detector is configured for this infrastructure category.")
     elif detector not in available:
-        column.caption(f"The server needs a trained checkpoint for {YOLO_MODELS[detector][2]}.")
+        with column:
+            show_state("detector_missing", f"{detector}: {YOLO_MODELS[detector][2]} could not be assessed.")
 
 
 def show_live_photos(contract, path, components, category, *, description=None):
@@ -2237,7 +2667,9 @@ def show_live_photos(contract, path, components, category, *, description=None):
     try:
         gallery, _ = api_data(f"{path}/images", {"page": page, "limit": 12})
     except (requests.RequestException, KeyError, ValueError):
-        st.warning("The API could not load the photo gallery.")
+        error_state("Photos could not be retrieved.", "The BetterGov API did not return this contract's gallery.",
+                    kept="The contract record and saved review above are unaffected.",
+                    retry_label="Retry loading photos", on_retry=refresh_live_results, key=f"retry_gallery_{contract}")
         return
     pagination = gallery["pagination"]
     if page > max(1, pagination["totalPages"]):
@@ -2253,8 +2685,13 @@ def show_live_photos(contract, path, components, category, *, description=None):
         st.number_input("Photo page", min_value=1, max_value=pagination["totalPages"], step=1, key=page_key)
     photos = [photo for photo in gallery["images"] if urlsplit(photo.get("url") or "").scheme == "https"]
     if not photos:
-        st.caption("No photos returned for this page.")
+        if pagination["totalCount"] == 0:
+            show_state("no_photos")
+        else:
+            show_state("retrieval_failed", "The gallery reports photos, but none were returned for this page.")
         return
+    st.caption("Live detector observations on source photos. They are not saved and do not change the saved "
+               "photo evidence assessment above.")
     if len(photos) != pagination["totalCount"]:
         st.caption(f"Photo entries on this page · {len(photos):,}")
     override = st.selectbox(
@@ -2290,15 +2727,24 @@ def show_live_photos(contract, path, components, category, *, description=None):
                 load_photo_model(*weights)
                 models[kind] = weights
             except ModuleNotFoundError:
-                st.info("Install the dashboard's optional YOLO dependency to enable photo analysis.")
+                notice("Photo analysis is not installed.",
+                       "Install the dashboard's optional YOLO dependency to enable detector observations.")
                 break
             except (OSError, RuntimeError, ValueError):
-                st.warning(f"The YOLO model for {kind} could not be loaded.")
+                error_state(f"The YOLO model for {kind} could not be loaded.", "Its checkpoint could not be read.",
+                            kept="Photos are still shown without this detector's observations.")
+    gallery_latest = reported_day(date_range.get("latest")) or language.latest_capture_day(photos)
     for start in range(0, len(routed_photos), 3):
-        for column, (photo, component, photo_category, detectors) in zip(st.columns(3), routed_photos[start:start + 3]):
-            captured = pd.to_datetime(photo.get("capturedAt"), errors="coerce")
-            caption = [format_date(captured), photo.get("componentId"), photo.get("purpose")]
-            column.image(photo["url"], caption=" · ".join(part for part in caption if part))
+        for offset, (column, (photo, component, photo_category, detectors)) in enumerate(
+                zip(st.columns(3), routed_photos[start:start + 3])):
+            index = start + offset
+            role = language.photo_role([p for p, *_ in routed_photos], index, gallery_latest)
+            role = {"latest date": "latest gallery date", "historical": "earlier date"}.get(role, role)
+            caption = [f"Photo {index + 1}", language.format_timestamp(photo.get("capturedAt")), role,
+                       photo.get("componentId"), photo.get("purpose")]
+            with column:
+                photo_with_fallback(photo["url"], f"Project photo {index + 1}, {role}",
+                                    " · ".join(str(part) for part in caption if part))
             work = component.get("typeOfWork") or component.get("description")
             if work:
                 column.caption(f"Reported work · {work}")
@@ -2309,33 +2755,34 @@ def show_live_photos(contract, path, components, category, *, description=None):
                 if finding := show_photo_analysis(column, photo["url"], detector, supported, available, models):
                     findings.append(finding)
             if findings and not any(f.startswith("YOLO detected ") for f in findings):
-                column.caption("No features detected." if any(f.startswith("YOLO found no ") for f in findings)
-                               else "AI photo analysis was unavailable.")
+                with column:
+                    show_state("no_detection" if any(f.startswith("YOLO found no ") for f in findings) else "analysis_failed")
             column.link_button("Open original", photo["url"])
 
 
 def show_contract(contract, row):
     st.subheader(contract)
-    st.write(row["description"])
+    if pd.notna(row["description"]):
+        st.text(row["description"])
     contractor = row.get("contractor")
     st.text(f"Contractor · {contractor or 'Unavailable'}")
     details = st.columns(3)
-    details[0].metric("Reported status", row["status"] if pd.notna(row["status"]) else "Unavailable")
+    details[0].metric("Reported status", row["status"] if pd.notna(row["status"]) else "Unavailable",
+                      help="As published in the DPWH record. Not a photo assessment.")
     details[1].metric("Reported completion", format_date(row["completionDate"]))
-    details[2].metric("Latest evidence date", format_date(row["evidenceDate"]))
+    details[2].metric("Latest photo date", format_date(row["evidenceDate"]))
     source = {"dpwh_metadata": "DPWH image metadata", "supplied_photos": "Supplied photo dates"}
-    st.caption(f"Date source · {source.get(row['evidenceSource'], 'Unavailable')}")
-    for key, label in FLAGS.items():
-        if row[key]:
-            st.warning(label)
+    st.caption(f"Photo date source · {source.get(row['evidenceSource'], 'Unavailable')}")
+    notes = [label for key, label in FLAGS.items() if row[key]]
+    if notes:
+        notice("Record notes for review · not findings", " · ".join(notes), icon=":material/flag:")
     days = row["daysFromCompletion"]
     if pd.notna(days) and days:
-        direction = "after" if days > 0 else "before"
-        st.write(f"Latest evidence is {abs(days)} days {direction} reported completion.")
+        st.caption(f"{language.photo_timing_text(int(days))}. {language.TIMING_NOTE}")
 
 
 def format_date(value):
-    return value.strftime("%d %b %Y") if pd.notna(value) else "Unavailable"
+    return value.strftime("%d %b %Y") if pd.notna(value) else "Date unknown"
 
 
 if __name__ == "__main__":

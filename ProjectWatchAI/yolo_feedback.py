@@ -71,20 +71,31 @@ def latest_candidate(detector):
     return None
 
 
+def outline_problem(points, size=None):
+    """Why an outline cannot be saved, or None. The one authority for save_correction and the forms.
+
+    ``size`` is the photo (width, height); without it only the shape of the points is checked.
+    """
+    if not isinstance(points, list) or not 3 <= len(points) <= 250:
+        return "Outline the correct region with at least three points and select Use outline."
+    for point in points:
+        if not isinstance(point, list) or len(point) != 2 or not all(
+            isinstance(value, (int, float)) and 0 <= value <= 1 for value in point
+        ):
+            return "The outline has an invalid point."
+    if size is not None:
+        mask = Image.new("1", size)
+        ImageDraw.Draw(mask).polygon([(x * size[0], y * size[1]) for x, y in points], fill=1)
+        if len(set(map(tuple, points))) < 3 or sum(mask.getdata()) < 25:
+            return "Outline a larger region of the photo."
+    return None
+
+
 def save_correction(detector, digest, photo, label, points, *, contract_id=None, append=False):
     polygon = []
     if label is not None:
-        if not isinstance(points, list) or not 3 <= len(points) <= 250:
-            raise ValueError("Outline the correct region with at least three points and select Use outline.")
-        for point in points:
-            if not isinstance(point, list) or len(point) != 2 or not all(
-                isinstance(value, (int, float)) and 0 <= value <= 1 for value in point
-            ):
-                raise ValueError("The outline has an invalid point.")
-        mask = Image.new("1", photo.size)
-        ImageDraw.Draw(mask).polygon([(x * photo.width, y * photo.height) for x, y in points], fill=1)
-        if len(set(map(tuple, points))) < 3 or sum(mask.getdata()) < 25:
-            raise ValueError("Outline a larger region of the photo.")
+        if problem := outline_problem(points, photo.size):
+            raise ValueError(problem)
         polygon = [value for point in points for value in point]
     folder = feedback_folder(detector)
     folder.mkdir(parents=True, exist_ok=True)
@@ -136,6 +147,7 @@ def train_candidate(detector, weights, classes, image_size, device, *, skip_conf
     candidates.mkdir()
     by_file = {row["file"]: row for row in rows}
     feedback_pixels = set()
+    excluded_unknown = 0
     for correction in corrections:
         path = folder / correction["file"]
         with Image.open(path) as photo:
@@ -146,9 +158,10 @@ def train_candidate(detector, weights, classes, image_size, device, *, skip_conf
             raise ValueError("Two saved corrections use the same photo pixels. Keep one correction per photo.")
         previous = existing.get(correction["sourceSha256"]) or normalized.get(pixel_digest)
         if not correction.get("contractId") and previous is None:
-            if skip_conflicts:
-                continue
-            raise ValueError("Add a source contract/project ID to this correction before training; unknown provenance cannot be split safely.")
+            # Unknown provenance is saved but never trained on: it cannot be checked against the held-out split.
+            # It is left out, not an error, so other eligible corrections can still train.
+            excluded_unknown += 1
+            continue
         if correction.get("contractId") in held_out:
             if skip_conflicts:
                 continue
@@ -173,7 +186,9 @@ def train_candidate(detector, weights, classes, image_size, device, *, skip_conf
         by_file[row["file"]] = row
         copyfile(path, candidates / row["file"])
     if not feedback_pixels:
-        raise ValueError("No eligible corrections remain after checking the training split.")
+        raise ValueError("No eligible corrections remain after checking the training split."
+                         + (f" {excluded_unknown} saved correction(s) have no source contract ID and are excluded "
+                            "from training until their source is identified." if excluded_unknown else ""))
     for row in by_file.values():
         destination = candidates / row["file"]
         if not destination.exists():
